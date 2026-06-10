@@ -336,6 +336,72 @@ impl Tensor {
         self.reshape(vec![self.len()])
     }
 
+    /// Returns the transpose of a two-dimensional tensor.
+    pub fn transpose(&self) -> Result<Self> {
+        let rows = self.rows().ok_or_else(|| RustGradError::InvalidArgument {
+            name: "rank",
+            reason: format!("transpose expects rank 2, got rank {}", self.rank()),
+        })?;
+        let cols = self.cols().expect("matrix tensors always have columns");
+        let mut data = vec![0.0; self.len()];
+
+        for row in 0..rows {
+            for col in 0..cols {
+                data[col * rows + row] = self.data[row * cols + col];
+            }
+        }
+
+        Self::matrix(cols, rows, data)
+    }
+
+    /// Returns the sum of all tensor values as a scalar-like tensor.
+    pub fn sum(&self) -> Result<Self> {
+        Self::scalar(self.data.iter().sum())
+    }
+
+    /// Returns sums along one axis.
+    ///
+    /// For vectors, axis 0 returns a scalar-like tensor. For matrices, axis 0
+    /// returns column sums and axis 1 returns row sums.
+    pub fn sum_axis(&self, axis: usize) -> Result<Self> {
+        match self.rank() {
+            1 => {
+                if axis == 0 {
+                    self.sum()
+                } else {
+                    Err(RustGradError::InvalidAxis { axis, rank: 1 })
+                }
+            }
+            2 => self.sum_matrix_axis(axis),
+            rank => Err(RustGradError::InvalidArgument {
+                name: "rank",
+                reason: format!("sum_axis supports rank 1 or 2, got rank {rank}"),
+            }),
+        }
+    }
+
+    /// Returns the mean of all tensor values as a scalar-like tensor.
+    pub fn mean(&self) -> Result<Self> {
+        Self::scalar(self.data.iter().sum::<f64>() / self.len() as f64)
+    }
+
+    /// Returns means along one axis.
+    ///
+    /// For vectors, axis 0 returns a scalar-like tensor. For matrices, axis 0
+    /// returns column means and axis 1 returns row means.
+    pub fn mean_axis(&self, axis: usize) -> Result<Self> {
+        let sums = self.sum_axis(axis)?;
+        let divisor = match self.rank() {
+            1 => self.len(),
+            2 if axis == 0 => self.rows().expect("matrix tensors always have rows"),
+            2 if axis == 1 => self.cols().expect("matrix tensors always have columns"),
+            _ => unreachable!("sum_axis validates rank and axis"),
+        } as f64;
+
+        let data = sums.data.iter().map(|value| value / divisor).collect();
+        Self::new(sums.shape, data)
+    }
+
     /// Adds two tensors element by element.
     ///
     /// Shapes must be equal unless one side is scalar-like, in which case that
@@ -413,6 +479,28 @@ impl Tensor {
             left: self.shape.to_vec(),
             right: rhs.shape.to_vec(),
         })
+    }
+
+    fn sum_matrix_axis(&self, axis: usize) -> Result<Self> {
+        let rows = self.rows().expect("matrix tensors always have rows");
+        let cols = self.cols().expect("matrix tensors always have columns");
+
+        match axis {
+            0 => {
+                let mut data = vec![0.0; cols];
+                for row in 0..rows {
+                    for (col, value) in data.iter_mut().enumerate() {
+                        *value += self.data[row * cols + col];
+                    }
+                }
+                Self::vector(data)
+            }
+            1 => {
+                let data = self.data.chunks(cols).map(|row| row.iter().sum()).collect();
+                Self::vector(data)
+            }
+            _ => Err(RustGradError::InvalidAxis { axis, rank: 2 }),
+        }
     }
 }
 
@@ -803,5 +891,115 @@ mod tests {
         assert_eq!(left.data(), &[1.0, 2.0, 3.0]);
         assert_eq!(right.data(), &[2.0]);
         assert_eq!(output.data(), &[2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn transposes_matrix_tensor() {
+        let tensor =
+            Tensor::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("valid matrix");
+
+        let output = tensor.transpose().expect("matrix should transpose");
+
+        assert_eq!(output.dims(), &[3, 2]);
+        assert_eq!(output.data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn rejects_transpose_for_non_matrix_tensor() {
+        let tensor = Tensor::vector(vec![1.0, 2.0, 3.0]).expect("valid vector");
+
+        assert_eq!(
+            tensor.transpose().expect_err("vector should not transpose"),
+            RustGradError::InvalidArgument {
+                name: "rank",
+                reason: "transpose expects rank 2, got rank 1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sums_all_values() {
+        let tensor = Tensor::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("valid matrix");
+
+        let output = tensor.sum().expect("sum should produce scalar");
+
+        assert_eq!(output.dims(), &[1]);
+        assert_eq!(output.data(), &[10.0]);
+    }
+
+    #[test]
+    fn averages_all_values() {
+        let tensor = Tensor::vector(vec![2.0, 4.0, 6.0, 8.0]).expect("valid vector");
+
+        let output = tensor.mean().expect("mean should produce scalar");
+
+        assert_eq!(output.dims(), &[1]);
+        assert_eq!(output.data(), &[5.0]);
+    }
+
+    #[test]
+    fn sums_vector_axis_zero() {
+        let tensor = Tensor::vector(vec![1.0, 2.0, 3.0]).expect("valid vector");
+
+        let output = tensor.sum_axis(0).expect("axis zero should sum vector");
+
+        assert_eq!(output.dims(), &[1]);
+        assert_eq!(output.data(), &[6.0]);
+    }
+
+    #[test]
+    fn sums_matrix_axis_zero_as_column_sums() {
+        let tensor =
+            Tensor::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("valid matrix");
+
+        let output = tensor.sum_axis(0).expect("axis zero should sum columns");
+
+        assert_eq!(output.dims(), &[3]);
+        assert_eq!(output.data(), &[5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn sums_matrix_axis_one_as_row_sums() {
+        let tensor =
+            Tensor::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("valid matrix");
+
+        let output = tensor.sum_axis(1).expect("axis one should sum rows");
+
+        assert_eq!(output.dims(), &[2]);
+        assert_eq!(output.data(), &[6.0, 15.0]);
+    }
+
+    #[test]
+    fn averages_matrix_axis_zero_as_column_means() {
+        let tensor =
+            Tensor::matrix(2, 3, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]).expect("valid matrix");
+
+        let output = tensor
+            .mean_axis(0)
+            .expect("axis zero should average columns");
+
+        assert_eq!(output.dims(), &[3]);
+        assert_eq!(output.data(), &[5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn averages_matrix_axis_one_as_row_means() {
+        let tensor =
+            Tensor::matrix(2, 3, vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]).expect("valid matrix");
+
+        let output = tensor.mean_axis(1).expect("axis one should average rows");
+
+        assert_eq!(output.dims(), &[2]);
+        assert_eq!(output.data(), &[4.0, 10.0]);
+    }
+
+    #[test]
+    fn rejects_invalid_reduction_axis() {
+        let tensor = Tensor::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("valid matrix");
+
+        assert_eq!(
+            tensor.sum_axis(2).expect_err("axis two is invalid"),
+            RustGradError::InvalidAxis { axis: 2, rank: 2 }
+        );
     }
 }

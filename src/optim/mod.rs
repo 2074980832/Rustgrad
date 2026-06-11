@@ -154,3 +154,200 @@ fn validate_gradient_shape(parameter: &Tensor, gradient: &Tensor) -> Result<()> 
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{GradientSet, Optimizer, SGD};
+    use crate::tensor::Tensor;
+    use crate::RustGradError;
+
+    const EPSILON: f64 = 1e-12;
+
+    fn assert_slice_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected.iter()) {
+            assert!(
+                (actual - expected).abs() < EPSILON,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_set_starts_empty() {
+        let gradients = GradientSet::new();
+
+        assert!(gradients.is_empty());
+        assert_eq!(gradients.len(), 0);
+        assert!(gradients.get(0).is_none());
+        assert_eq!(gradients.iter().count(), 0);
+    }
+
+    #[test]
+    fn gradient_set_keeps_gradients_in_parameter_order() {
+        let first = Tensor::vector(vec![1.0, 2.0]).expect("valid first gradient");
+        let second = Tensor::matrix(1, 2, vec![3.0, 4.0]).expect("valid second gradient");
+        let gradients = GradientSet::from_tensors(vec![first.clone(), second.clone()]);
+
+        assert_eq!(gradients.len(), 2);
+        assert_eq!(gradients.get(0), Some(&first));
+        assert_eq!(gradients.get(1), Some(&second));
+        assert_eq!(
+            gradients.iter().map(Tensor::dims).collect::<Vec<_>>(),
+            vec![&[2][..], &[1, 2][..]]
+        );
+    }
+
+    #[test]
+    fn gradient_set_can_be_created_from_vec_and_cleared() {
+        let mut gradients: GradientSet =
+            vec![Tensor::scalar(1.0).expect("valid scalar gradient")].into();
+
+        assert_eq!(gradients.len(), 1);
+
+        gradients.clear();
+
+        assert!(gradients.is_empty());
+    }
+
+    #[test]
+    fn sgd_exposes_name_and_learning_rate() {
+        let optimizer = SGD::new(0.05).expect("valid learning rate");
+
+        assert_eq!(optimizer.name(), "sgd");
+        assert_eq!(optimizer.learning_rate(), 0.05);
+    }
+
+    #[test]
+    fn sgd_can_update_learning_rate() {
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+
+        optimizer
+            .set_learning_rate(0.25)
+            .expect("learning rate update should succeed");
+
+        assert_eq!(optimizer.learning_rate(), 0.25);
+    }
+
+    #[test]
+    fn sgd_rejects_invalid_learning_rate_on_create() {
+        let error = SGD::new(0.0).expect_err("zero learning rate should fail");
+
+        assert_eq!(
+            error,
+            RustGradError::InvalidArgument {
+                name: "learning_rate",
+                reason: "learning rate must be finite and greater than zero".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sgd_rejects_invalid_learning_rate_on_update() {
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+
+        let error = optimizer
+            .set_learning_rate(f64::INFINITY)
+            .expect_err("infinite learning rate should fail");
+
+        assert_eq!(
+            error,
+            RustGradError::InvalidArgument {
+                name: "learning_rate",
+                reason: "learning rate must be finite and greater than zero".to_string(),
+            }
+        );
+        assert_eq!(optimizer.learning_rate(), 0.1);
+    }
+
+    #[test]
+    fn sgd_updates_single_parameter_tensor() {
+        let mut parameter = Tensor::vector(vec![1.0, -2.0, 3.0]).expect("valid parameter");
+        let gradients = GradientSet::from_tensors(vec![
+            Tensor::vector(vec![0.5, -1.0, 2.0]).expect("valid gradient")
+        ]);
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+        let mut parameters = vec![&mut parameter];
+
+        optimizer
+            .step(&mut parameters, &gradients)
+            .expect("sgd step should succeed");
+
+        assert_slice_close(parameter.data(), &[0.95, -1.9, 2.8]);
+    }
+
+    #[test]
+    fn sgd_updates_multiple_parameter_tensors() {
+        let mut weights = Tensor::matrix(1, 2, vec![1.0, 2.0]).expect("valid weights");
+        let mut bias = Tensor::vector(vec![0.5, -0.5]).expect("valid bias");
+        let gradients = GradientSet::from_tensors(vec![
+            Tensor::matrix(1, 2, vec![0.2, -0.4]).expect("valid weight gradient"),
+            Tensor::vector(vec![1.0, -1.0]).expect("valid bias gradient"),
+        ]);
+        let mut optimizer = SGD::new(0.5).expect("valid learning rate");
+        let mut parameters = vec![&mut weights, &mut bias];
+
+        optimizer
+            .step(&mut parameters, &gradients)
+            .expect("sgd step should succeed");
+
+        assert_slice_close(weights.data(), &[0.9, 2.2]);
+        assert_slice_close(bias.data(), &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn sgd_rejects_gradient_count_mismatch() {
+        let mut parameter = Tensor::scalar(1.0).expect("valid parameter");
+        let gradients = GradientSet::new();
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+        let mut parameters = vec![&mut parameter];
+
+        let error = optimizer
+            .step(&mut parameters, &gradients)
+            .expect_err("missing gradient should fail");
+
+        assert_eq!(
+            error,
+            RustGradError::InvalidArgument {
+                name: "gradients",
+                reason: "expected 1 gradients, got 0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sgd_rejects_gradient_shape_mismatch() {
+        let mut parameter = Tensor::vector(vec![1.0, 2.0]).expect("valid parameter");
+        let gradients = GradientSet::from_tensors(vec![
+            Tensor::matrix(1, 2, vec![0.1, 0.2]).expect("valid gradient")
+        ]);
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+        let mut parameters = vec![&mut parameter];
+
+        let error = optimizer
+            .step(&mut parameters, &gradients)
+            .expect_err("shape mismatch should fail");
+
+        assert_eq!(
+            error,
+            RustGradError::ShapeMismatch {
+                op: "optimizer gradient",
+                left: vec![2],
+                right: vec![1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn sgd_does_not_update_parameter_when_shape_validation_fails() {
+        let mut parameter = Tensor::vector(vec![1.0, 2.0]).expect("valid parameter");
+        let gradients =
+            GradientSet::from_tensors(vec![Tensor::scalar(10.0).expect("invalid gradient shape")]);
+        let mut optimizer = SGD::new(0.1).expect("valid learning rate");
+        let mut parameters = vec![&mut parameter];
+
+        let _ = optimizer.step(&mut parameters, &gradients);
+
+        assert_eq!(parameter.data(), &[1.0, 2.0]);
+    }
+}

@@ -386,6 +386,10 @@ impl ComputationGraph {
 
         match node.operation_kind() {
             Operation::Leaf => Ok(Vec::new()),
+            Operation::Add => self.add_gradients(node.parents(), upstream_grad),
+            Operation::Sub => self.sub_gradients(node.parents(), upstream_grad),
+            Operation::Mul => self.mul_gradients(node.parents(), upstream_grad),
+            Operation::Div => self.div_gradients(node.parents(), upstream_grad),
             operation => Err(RustGradError::UnsupportedOperation {
                 op: operation.name().to_string(),
                 reason: format!(
@@ -394,6 +398,142 @@ impl ComputationGraph {
                 ),
             }),
         }
+    }
+
+    fn add_gradients(
+        &self,
+        parents: &[NodeId],
+        upstream_grad: &Tensor,
+    ) -> Result<Vec<(NodeId, Tensor)>> {
+        let (left_id, left_value, right_id, right_value) =
+            self.binary_parent_values(parents, "add")?;
+
+        Ok(vec![
+            (
+                left_id,
+                Self::fit_gradient_to_parent(&left_value, upstream_grad.clone())?,
+            ),
+            (
+                right_id,
+                Self::fit_gradient_to_parent(&right_value, upstream_grad.clone())?,
+            ),
+        ])
+    }
+
+    fn sub_gradients(
+        &self,
+        parents: &[NodeId],
+        upstream_grad: &Tensor,
+    ) -> Result<Vec<(NodeId, Tensor)>> {
+        let (left_id, left_value, right_id, right_value) =
+            self.binary_parent_values(parents, "sub")?;
+        let negative_upstream = upstream_grad.mul(&Tensor::scalar(-1.0)?)?;
+
+        Ok(vec![
+            (
+                left_id,
+                Self::fit_gradient_to_parent(&left_value, upstream_grad.clone())?,
+            ),
+            (
+                right_id,
+                Self::fit_gradient_to_parent(&right_value, negative_upstream)?,
+            ),
+        ])
+    }
+
+    fn mul_gradients(
+        &self,
+        parents: &[NodeId],
+        upstream_grad: &Tensor,
+    ) -> Result<Vec<(NodeId, Tensor)>> {
+        let (left_id, left_value, right_id, right_value) =
+            self.binary_parent_values(parents, "mul")?;
+        let left_grad = upstream_grad.mul(&right_value)?;
+        let right_grad = upstream_grad.mul(&left_value)?;
+
+        Ok(vec![
+            (
+                left_id,
+                Self::fit_gradient_to_parent(&left_value, left_grad)?,
+            ),
+            (
+                right_id,
+                Self::fit_gradient_to_parent(&right_value, right_grad)?,
+            ),
+        ])
+    }
+
+    fn div_gradients(
+        &self,
+        parents: &[NodeId],
+        upstream_grad: &Tensor,
+    ) -> Result<Vec<(NodeId, Tensor)>> {
+        let (left_id, left_value, right_id, right_value) =
+            self.binary_parent_values(parents, "div")?;
+        let left_grad = upstream_grad.div(&right_value)?;
+        let right_squared = right_value.mul(&right_value)?;
+        let right_grad = upstream_grad
+            .mul(&left_value)?
+            .div(&right_squared)?
+            .mul(&Tensor::scalar(-1.0)?)?;
+
+        Ok(vec![
+            (
+                left_id,
+                Self::fit_gradient_to_parent(&left_value, left_grad)?,
+            ),
+            (
+                right_id,
+                Self::fit_gradient_to_parent(&right_value, right_grad)?,
+            ),
+        ])
+    }
+
+    fn binary_parent_values(
+        &self,
+        parents: &[NodeId],
+        op: &'static str,
+    ) -> Result<(NodeId, Tensor, NodeId, Tensor)> {
+        let [left_id, right_id] = parents else {
+            return Err(RustGradError::InvalidArgument {
+                name: "parents",
+                reason: format!("{op} expects exactly 2 parents, got {}", parents.len()),
+            });
+        };
+        let left_value = self
+            .node(*left_id)
+            .ok_or_else(|| RustGradError::InvalidArgument {
+                name: "parents",
+                reason: format!("node {} does not exist", left_id.index()),
+            })?
+            .value()
+            .clone();
+        let right_value = self
+            .node(*right_id)
+            .ok_or_else(|| RustGradError::InvalidArgument {
+                name: "parents",
+                reason: format!("node {} does not exist", right_id.index()),
+            })?
+            .value()
+            .clone();
+
+        Ok((*left_id, left_value, *right_id, right_value))
+    }
+
+    fn fit_gradient_to_parent(parent_value: &Tensor, grad: Tensor) -> Result<Tensor> {
+        if parent_value.dims() == grad.dims() {
+            return Ok(grad);
+        }
+
+        if parent_value.shape().is_scalar_like() {
+            return grad.sum();
+        }
+
+        Err(RustGradError::ShapeMismatch {
+            op: "gradient",
+            left: parent_value.shape().to_vec(),
+            right: grad.shape().to_vec(),
+        })
     }
 }
 
@@ -597,7 +737,7 @@ mod tests {
         let right = graph.add_leaf(Tensor::scalar(2.0).expect("valid scalar"), true);
         let output = graph
             .add_operation(
-                Operation::Add,
+                Operation::MatMul,
                 vec![left, right],
                 Tensor::scalar(3.0).expect("valid scalar"),
                 true,
@@ -607,11 +747,230 @@ mod tests {
         assert_eq!(
             graph
                 .backward(output)
-                .expect_err("add gradient rule is not implemented yet"),
+                .expect_err("matmul gradient rule is not implemented yet"),
             RustGradError::UnsupportedOperation {
-                op: "add".to_string(),
+                op: "matmul".to_string(),
                 reason: "gradient rule is not implemented yet for upstream shape [1]".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn backward_computes_add_gradients_for_scalars() {
+        let mut graph = ComputationGraph::new();
+        let left = graph.add_leaf(Tensor::scalar(2.0).expect("valid scalar"), true);
+        let right = graph.add_leaf(Tensor::scalar(3.0).expect("valid scalar"), true);
+        let output = graph
+            .add_operation(
+                Operation::Add,
+                vec![left, right],
+                Tensor::scalar(5.0).expect("valid scalar"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("add backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(left)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[1.0][..])
+        );
+        assert_eq!(
+            graph
+                .node(right)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[1.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_computes_sub_gradients_for_scalars() {
+        let mut graph = ComputationGraph::new();
+        let left = graph.add_leaf(Tensor::scalar(7.0).expect("valid scalar"), true);
+        let right = graph.add_leaf(Tensor::scalar(4.0).expect("valid scalar"), true);
+        let output = graph
+            .add_operation(
+                Operation::Sub,
+                vec![left, right],
+                Tensor::scalar(3.0).expect("valid scalar"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("sub backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(left)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[1.0][..])
+        );
+        assert_eq!(
+            graph
+                .node(right)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[-1.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_computes_mul_gradients_for_scalars() {
+        let mut graph = ComputationGraph::new();
+        let left = graph.add_leaf(Tensor::scalar(3.0).expect("valid scalar"), true);
+        let right = graph.add_leaf(Tensor::scalar(5.0).expect("valid scalar"), true);
+        let output = graph
+            .add_operation(
+                Operation::Mul,
+                vec![left, right],
+                Tensor::scalar(15.0).expect("valid scalar"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("mul backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(left)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[5.0][..])
+        );
+        assert_eq!(
+            graph
+                .node(right)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[3.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_computes_div_gradients_for_scalars() {
+        let mut graph = ComputationGraph::new();
+        let left = graph.add_leaf(Tensor::scalar(8.0).expect("valid scalar"), true);
+        let right = graph.add_leaf(Tensor::scalar(2.0).expect("valid scalar"), true);
+        let output = graph
+            .add_operation(
+                Operation::Div,
+                vec![left, right],
+                Tensor::scalar(4.0).expect("valid scalar"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("div backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(left)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[0.5][..])
+        );
+        assert_eq!(
+            graph
+                .node(right)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[-2.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_computes_elementwise_vector_multiply_gradients() {
+        let mut graph = ComputationGraph::new();
+        let left = graph.add_leaf(Tensor::vector(vec![2.0, 3.0]).expect("valid vector"), true);
+        let right = graph.add_leaf(Tensor::vector(vec![5.0, 7.0]).expect("valid vector"), true);
+        let output = graph
+            .add_operation(
+                Operation::Mul,
+                vec![left, right],
+                Tensor::vector(vec![10.0, 21.0]).expect("valid vector"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("mul backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(left)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[5.0, 7.0][..])
+        );
+        assert_eq!(
+            graph
+                .node(right)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[2.0, 3.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_reduces_broadcast_gradient_back_to_scalar_parent() {
+        let mut graph = ComputationGraph::new();
+        let scalar = graph.add_leaf(Tensor::scalar(2.0).expect("valid scalar"), true);
+        let vector = graph.add_leaf(
+            Tensor::vector(vec![3.0, 4.0, 5.0]).expect("valid vector"),
+            true,
+        );
+        let output = graph
+            .add_operation(
+                Operation::Mul,
+                vec![scalar, vector],
+                Tensor::vector(vec![6.0, 8.0, 10.0]).expect("valid vector"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("mul backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(scalar)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[12.0][..])
+        );
+        assert_eq!(
+            graph
+                .node(vector)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[2.0, 2.0, 2.0][..])
+        );
+    }
+
+    #[test]
+    fn backward_accumulates_gradients_for_repeated_parent() {
+        let mut graph = ComputationGraph::new();
+        let value = graph.add_leaf(Tensor::scalar(2.0).expect("valid scalar"), true);
+        let output = graph
+            .add_operation(
+                Operation::Add,
+                vec![value, value],
+                Tensor::scalar(4.0).expect("valid scalar"),
+                true,
+            )
+            .expect("parents should exist");
+
+        graph.backward(output).expect("add backward should succeed");
+
+        assert_eq!(
+            graph
+                .node(value)
+                .and_then(|node| node.grad())
+                .map(Tensor::data),
+            Some(&[2.0][..])
         );
     }
 }

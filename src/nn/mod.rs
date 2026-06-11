@@ -3,6 +3,197 @@
 use crate::tensor::Tensor;
 use crate::{Result, RustGradError};
 
+/// Common interface for neural network components.
+pub trait Module {
+    /// Computes the module output for an input tensor.
+    fn forward(&self, input: &Tensor) -> Result<Tensor>;
+
+    /// Returns immutable trainable parameters.
+    fn parameters(&self) -> Vec<&Tensor> {
+        Vec::new()
+    }
+
+    /// Returns mutable trainable parameters.
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        Vec::new()
+    }
+
+    /// Returns a stable module name for reports and debugging.
+    fn name(&self) -> &str;
+}
+
+/// Fully connected layer with row-major weights.
+///
+/// The layer computes `output = input @ weights + bias`. Weights have shape
+/// `[input_size, output_size]`, and bias has shape `[output_size]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Linear {
+    input_size: usize,
+    output_size: usize,
+    weights: Tensor,
+    bias: Tensor,
+}
+
+impl Linear {
+    /// Creates a linear layer with deterministic small weights and zero bias.
+    pub fn new(input_size: usize, output_size: usize) -> Result<Self> {
+        Self::validate_size("input_size", input_size)?;
+        Self::validate_size("output_size", output_size)?;
+
+        let scale = (2.0 / (input_size + output_size) as f64).sqrt();
+        let weights = (0..input_size * output_size)
+            .map(|index| {
+                let pattern = (index % output_size) as f64 - (output_size as f64 - 1.0) / 2.0;
+                pattern * scale
+            })
+            .collect();
+
+        Self::with_parameters(
+            Tensor::matrix(input_size, output_size, weights)?,
+            Tensor::zeros(vec![output_size])?,
+        )
+    }
+
+    /// Creates a linear layer from explicit weights and bias tensors.
+    pub fn with_parameters(weights: Tensor, bias: Tensor) -> Result<Self> {
+        let input_size = weights
+            .rows()
+            .ok_or_else(|| RustGradError::InvalidArgument {
+                name: "weights",
+                reason: format!("linear weights must be rank 2, got rank {}", weights.rank()),
+            })?;
+        let output_size = weights.cols().expect("rank 2 tensors always have columns");
+
+        if !bias.shape().is_vector() || bias.len() != output_size {
+            return Err(RustGradError::ShapeMismatch {
+                op: "linear bias",
+                left: vec![output_size],
+                right: bias.shape().to_vec(),
+            });
+        }
+
+        Ok(Self {
+            input_size,
+            output_size,
+            weights,
+            bias,
+        })
+    }
+
+    /// Returns the expected number of input features.
+    #[must_use]
+    pub fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    /// Returns the number of output features.
+    #[must_use]
+    pub fn output_size(&self) -> usize {
+        self.output_size
+    }
+
+    /// Returns the weight matrix.
+    #[must_use]
+    pub fn weights(&self) -> &Tensor {
+        &self.weights
+    }
+
+    /// Returns mutable weights.
+    #[must_use]
+    pub fn weights_mut(&mut self) -> &mut Tensor {
+        &mut self.weights
+    }
+
+    /// Returns the bias vector.
+    #[must_use]
+    pub fn bias(&self) -> &Tensor {
+        &self.bias
+    }
+
+    /// Returns mutable bias values.
+    #[must_use]
+    pub fn bias_mut(&mut self) -> &mut Tensor {
+        &mut self.bias
+    }
+
+    fn validate_size(name: &'static str, value: usize) -> Result<()> {
+        if value == 0 {
+            Err(RustGradError::InvalidArgument {
+                name,
+                reason: "size must be greater than zero".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn forward_vector(&self, input: &Tensor) -> Result<Tensor> {
+        if input.len() != self.input_size {
+            return Err(RustGradError::ShapeMismatch {
+                op: "linear input",
+                left: vec![self.input_size],
+                right: input.shape().to_vec(),
+            });
+        }
+
+        let matrix = input.reshape(vec![1, self.input_size])?;
+        let output = self.forward_matrix(&matrix)?;
+        output.flatten()
+    }
+
+    fn forward_matrix(&self, input: &Tensor) -> Result<Tensor> {
+        if input.cols() != Some(self.input_size) {
+            return Err(RustGradError::ShapeMismatch {
+                op: "linear input",
+                left: vec![self.input_size],
+                right: input.shape().to_vec(),
+            });
+        }
+
+        let output = input.matmul(&self.weights)?;
+        self.add_bias(&output)
+    }
+
+    fn add_bias(&self, output: &Tensor) -> Result<Tensor> {
+        let rows = output.rows().expect("linear output must be rank 2");
+        let cols = output.cols().expect("linear output must be rank 2");
+        let mut data = Vec::with_capacity(output.len());
+
+        for row in 0..rows {
+            for col in 0..cols {
+                data.push(output.get(&[row, col])? + self.bias.get_flat(col)?);
+            }
+        }
+
+        Tensor::matrix(rows, cols, data)
+    }
+}
+
+impl Module for Linear {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        match input.rank() {
+            1 => self.forward_vector(input),
+            2 => self.forward_matrix(input),
+            rank => Err(RustGradError::InvalidArgument {
+                name: "input",
+                reason: format!("linear input must be rank 1 or 2, got rank {rank}"),
+            }),
+        }
+    }
+
+    fn parameters(&self) -> Vec<&Tensor> {
+        vec![&self.weights, &self.bias]
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        vec![&mut self.weights, &mut self.bias]
+    }
+
+    fn name(&self) -> &str {
+        "linear"
+    }
+}
+
 /// Common activation functions used by neural networks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {

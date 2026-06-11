@@ -93,11 +93,9 @@ impl SGD {
 
 impl Optimizer for SGD {
     fn step(&mut self, parameters: &mut [&mut Tensor], gradients: &GradientSet) -> Result<()> {
-        validate_parameter_gradient_count(parameters.len(), gradients.len())?;
+        validate_parameter_gradient_shapes(parameters, gradients)?;
 
         for (parameter, gradient) in parameters.iter_mut().zip(gradients.iter()) {
-            validate_gradient_shape(parameter, gradient)?;
-
             for (value, &grad) in parameter.data_mut().iter_mut().zip(gradient.data()) {
                 *value -= self.learning_rate * grad;
             }
@@ -121,12 +119,142 @@ impl Optimizer for SGD {
     }
 }
 
+/// Momentum optimizer.
+///
+/// The update rule is `velocity = momentum * velocity + gradient`, followed by
+/// `parameter = parameter - learning_rate * velocity`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Momentum {
+    learning_rate: f64,
+    momentum: f64,
+    velocity: Vec<Tensor>,
+}
+
+impl Momentum {
+    /// Creates a Momentum optimizer.
+    pub fn new(learning_rate: f64, momentum: f64) -> Result<Self> {
+        validate_learning_rate(learning_rate)?;
+        validate_momentum(momentum)?;
+
+        Ok(Self {
+            learning_rate,
+            momentum,
+            velocity: Vec::new(),
+        })
+    }
+
+    /// Returns the momentum coefficient.
+    #[must_use]
+    pub fn momentum(&self) -> f64 {
+        self.momentum
+    }
+
+    /// Updates the momentum coefficient.
+    pub fn set_momentum(&mut self, momentum: f64) -> Result<()> {
+        validate_momentum(momentum)?;
+        self.momentum = momentum;
+        Ok(())
+    }
+
+    /// Returns the stored velocity tensors.
+    #[must_use]
+    pub fn velocity(&self) -> &[Tensor] {
+        &self.velocity
+    }
+
+    /// Clears optimizer state.
+    pub fn reset_state(&mut self) {
+        self.velocity.clear();
+    }
+
+    fn ensure_velocity(&mut self, parameters: &[&mut Tensor]) -> Result<()> {
+        let needs_reset = self.velocity.len() != parameters.len()
+            || self
+                .velocity
+                .iter()
+                .zip(parameters.iter())
+                .any(|(velocity, parameter)| velocity.dims() != parameter.dims());
+
+        if needs_reset {
+            self.velocity = parameters
+                .iter()
+                .map(|parameter| Tensor::zeros(parameter.shape().to_vec()))
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Optimizer for Momentum {
+    fn step(&mut self, parameters: &mut [&mut Tensor], gradients: &GradientSet) -> Result<()> {
+        validate_parameter_gradient_shapes(parameters, gradients)?;
+        self.ensure_velocity(parameters)?;
+
+        for ((parameter, gradient), velocity) in parameters
+            .iter_mut()
+            .zip(gradients.iter())
+            .zip(self.velocity.iter_mut())
+        {
+            for ((value, &grad), velocity_value) in parameter
+                .data_mut()
+                .iter_mut()
+                .zip(gradient.data())
+                .zip(velocity.data_mut())
+            {
+                *velocity_value = self.momentum * *velocity_value + grad;
+                *value -= self.learning_rate * *velocity_value;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.learning_rate
+    }
+
+    fn set_learning_rate(&mut self, learning_rate: f64) -> Result<()> {
+        validate_learning_rate(learning_rate)?;
+        self.learning_rate = learning_rate;
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "momentum"
+    }
+}
+
 fn validate_learning_rate(learning_rate: f64) -> Result<()> {
     if learning_rate <= 0.0 || !learning_rate.is_finite() {
         return Err(RustGradError::InvalidArgument {
             name: "learning_rate",
             reason: "learning rate must be finite and greater than zero".to_string(),
         });
+    }
+
+    Ok(())
+}
+
+fn validate_momentum(momentum: f64) -> Result<()> {
+    if !(0.0..1.0).contains(&momentum) || !momentum.is_finite() {
+        return Err(RustGradError::InvalidArgument {
+            name: "momentum",
+            reason: "momentum must be finite and in [0, 1)".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_parameter_gradient_shapes(
+    parameters: &[&mut Tensor],
+    gradients: &GradientSet,
+) -> Result<()> {
+    validate_parameter_gradient_count(parameters.len(), gradients.len())?;
+
+    for (parameter, gradient) in parameters.iter().zip(gradients.iter()) {
+        validate_gradient_shape(parameter, gradient)?;
     }
 
     Ok(())

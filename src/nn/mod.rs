@@ -424,7 +424,7 @@ fn softmax_slice(values: &[f64]) -> Vec<f64> {
 mod tests {
     use super::{
         relu, relu_derivative, sigmoid, sigmoid_derivative_from_output, softmax, tanh,
-        tanh_derivative_from_output, Activation,
+        tanh_derivative_from_output, Activation, ActivationLayer, Linear, Module, Sequential,
     };
     use crate::tensor::Tensor;
     use crate::RustGradError;
@@ -576,5 +576,174 @@ mod tests {
                 reason: "softmax supports rank 1 or 2, got rank 3".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn linear_new_creates_expected_parameter_shapes() {
+        let layer = Linear::new(3, 2).expect("linear layer should be valid");
+
+        assert_eq!(layer.input_size(), 3);
+        assert_eq!(layer.output_size(), 2);
+        assert_eq!(layer.weights().dims(), &[3, 2]);
+        assert_eq!(layer.bias().dims(), &[2]);
+        assert_eq!(layer.parameters().len(), 2);
+        assert_eq!(layer.name(), "linear");
+    }
+
+    #[test]
+    fn linear_forward_vector_matches_manual_calculation() {
+        let weights = Tensor::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("valid weights");
+        let bias = Tensor::vector(vec![0.5, -0.5]).expect("valid bias");
+        let layer = Linear::with_parameters(weights, bias).expect("valid layer");
+        let input = Tensor::vector(vec![2.0, 3.0]).expect("valid input");
+
+        let output = layer.forward(&input).expect("forward should succeed");
+
+        assert_eq!(output.dims(), &[2]);
+        assert_eq!(output.data(), &[11.5, 15.5]);
+    }
+
+    #[test]
+    fn linear_forward_matrix_applies_bias_to_each_row() {
+        let weights = Tensor::matrix(2, 2, vec![1.0, 0.0, 0.0, 1.0]).expect("valid weights");
+        let bias = Tensor::vector(vec![10.0, 20.0]).expect("valid bias");
+        let layer = Linear::with_parameters(weights, bias).expect("valid layer");
+        let input = Tensor::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("valid input");
+
+        let output = layer.forward(&input).expect("forward should succeed");
+
+        assert_eq!(output.dims(), &[2, 2]);
+        assert_eq!(output.data(), &[11.0, 22.0, 13.0, 24.0]);
+    }
+
+    #[test]
+    fn linear_rejects_invalid_layer_sizes() {
+        assert_eq!(
+            Linear::new(0, 2).expect_err("zero input size should fail"),
+            RustGradError::InvalidArgument {
+                name: "input_size",
+                reason: "size must be greater than zero".to_string(),
+            }
+        );
+        assert_eq!(
+            Linear::new(2, 0).expect_err("zero output size should fail"),
+            RustGradError::InvalidArgument {
+                name: "output_size",
+                reason: "size must be greater than zero".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn linear_rejects_invalid_bias_shape() {
+        let weights = Tensor::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).expect("valid weights");
+        let bias = Tensor::matrix(1, 2, vec![0.0, 0.0]).expect("invalid bias rank");
+
+        assert_eq!(
+            Linear::with_parameters(weights, bias).expect_err("bias must be vector"),
+            RustGradError::ShapeMismatch {
+                op: "linear bias",
+                left: vec![2],
+                right: vec![1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn linear_rejects_input_with_wrong_feature_count() {
+        let layer = Linear::new(3, 2).expect("valid layer");
+        let input = Tensor::vector(vec![1.0, 2.0]).expect("invalid input feature count");
+
+        assert_eq!(
+            layer
+                .forward(&input)
+                .expect_err("feature count should fail"),
+            RustGradError::ShapeMismatch {
+                op: "linear input",
+                left: vec![3],
+                right: vec![2],
+            }
+        );
+    }
+
+    #[test]
+    fn parameters_mut_can_update_linear_parameters() {
+        let mut layer = Linear::with_parameters(
+            Tensor::matrix(1, 1, vec![2.0]).expect("valid weights"),
+            Tensor::vector(vec![1.0]).expect("valid bias"),
+        )
+        .expect("valid layer");
+
+        {
+            let mut parameters = layer.parameters_mut();
+            parameters[0].set(&[0, 0], 3.0).expect("weight set");
+            parameters[1].set_flat(0, 4.0).expect("bias set");
+        }
+
+        let output = layer
+            .forward(&Tensor::vector(vec![2.0]).expect("valid input"))
+            .expect("forward should succeed");
+        assert_eq!(output.data(), &[10.0]);
+    }
+
+    #[test]
+    fn activation_layer_wraps_activation_as_module() {
+        let layer = ActivationLayer::new(Activation::Relu);
+        let input = Tensor::vector(vec![-1.0, 2.0]).expect("valid input");
+
+        let output = layer.forward(&input).expect("forward should succeed");
+
+        assert_eq!(layer.name(), "relu");
+        assert_eq!(layer.activation(), Activation::Relu);
+        assert_eq!(output.data(), &[0.0, 2.0]);
+        assert!(layer.parameters().is_empty());
+    }
+
+    #[test]
+    fn sequential_tracks_layer_names_and_length() {
+        let mut model = Sequential::new();
+        assert!(model.is_empty());
+
+        model.push(Linear::new(2, 2).expect("valid linear"));
+        model.push(ActivationLayer::new(Activation::Tanh));
+
+        assert_eq!(model.len(), 2);
+        assert_eq!(model.layer_names(), vec!["linear", "tanh"]);
+        assert_eq!(model.name(), "sequential");
+    }
+
+    #[test]
+    fn sequential_forward_applies_layers_in_order() {
+        let linear = Linear::with_parameters(
+            Tensor::matrix(2, 2, vec![1.0, 0.0, 0.0, 1.0]).expect("valid weights"),
+            Tensor::vector(vec![-2.0, 1.0]).expect("valid bias"),
+        )
+        .expect("valid linear");
+        let mut model = Sequential::new();
+        model.push(linear);
+        model.push(ActivationLayer::new(Activation::Relu));
+        let input = Tensor::vector(vec![1.0, 3.0]).expect("valid input");
+
+        let output = model.forward(&input).expect("forward should succeed");
+
+        assert_eq!(output.dims(), &[2]);
+        assert_eq!(output.data(), &[0.0, 4.0]);
+    }
+
+    #[test]
+    fn sequential_collects_parameters_from_child_layers() {
+        let model = Sequential::from_layers(vec![
+            Box::new(Linear::new(2, 3).expect("valid first linear")),
+            Box::new(ActivationLayer::new(Activation::Relu)),
+            Box::new(Linear::new(3, 1).expect("valid second linear")),
+        ]);
+
+        let parameters = model.parameters();
+
+        assert_eq!(parameters.len(), 4);
+        assert_eq!(parameters[0].dims(), &[2, 3]);
+        assert_eq!(parameters[1].dims(), &[3]);
+        assert_eq!(parameters[2].dims(), &[3, 1]);
+        assert_eq!(parameters[3].dims(), &[1]);
     }
 }

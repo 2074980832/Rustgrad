@@ -1,6 +1,6 @@
 //! Reusable training loops and training metrics.
 
-use crate::data::Dataset;
+use crate::data::{xor, Dataset};
 use crate::nn::{sigmoid, Linear, Module};
 use crate::optim::{GradientSet, Optimizer, SGD};
 use crate::tensor::Tensor;
@@ -277,6 +277,112 @@ impl BinaryClassificationResult {
     }
 }
 
+/// A tiny two-layer sigmoid MLP specialized for XOR-style binary tasks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XorMlp {
+    hidden: Linear,
+    output: Linear,
+    threshold: f64,
+}
+
+impl XorMlp {
+    /// Creates a deterministic 2-2-1 sigmoid MLP.
+    pub fn new(threshold: f64) -> Result<Self> {
+        validate_finite("threshold", threshold)?;
+
+        Ok(Self {
+            hidden: Linear::with_parameters(
+                Tensor::matrix(2, 2, vec![4.0, -4.0, 4.0, -4.0])?,
+                Tensor::vector(vec![-2.0, 6.0])?,
+            )?,
+            output: Linear::with_parameters(
+                Tensor::matrix(2, 1, vec![4.0, 4.0])?,
+                Tensor::vector(vec![-6.0])?,
+            )?,
+            threshold,
+        })
+    }
+
+    /// Returns the hidden linear layer.
+    #[must_use]
+    pub fn hidden(&self) -> &Linear {
+        &self.hidden
+    }
+
+    /// Returns the output linear layer.
+    #[must_use]
+    pub fn output(&self) -> &Linear {
+        &self.output
+    }
+
+    /// Returns the probability threshold used for class prediction.
+    #[must_use]
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// Computes hidden activations.
+    pub fn hidden_activations(&self, features: &Tensor) -> Result<Tensor> {
+        sigmoid(&self.hidden.forward(features)?)
+    }
+
+    /// Predicts positive-class probabilities.
+    pub fn predict_proba(&self, features: &Tensor) -> Result<Tensor> {
+        let hidden = self.hidden_activations(features)?;
+        sigmoid(&self.output.forward(&hidden)?)
+    }
+
+    /// Predicts binary classes as `0.0` or `1.0`.
+    pub fn predict_classes(&self, features: &Tensor) -> Result<Tensor> {
+        let probabilities = self.predict_proba(features)?;
+        threshold_probabilities(&probabilities, self.threshold)
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut hidden_parameters = self.hidden.parameters_mut();
+        let mut output_parameters = self.output.parameters_mut();
+        hidden_parameters.append(&mut output_parameters);
+        hidden_parameters
+    }
+}
+
+/// Result produced by XOR MLP training.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XorTrainingResult {
+    model: XorMlp,
+    history: TrainingHistory,
+}
+
+impl XorTrainingResult {
+    /// Creates a result from a trained XOR model and its history.
+    #[must_use]
+    pub fn new(model: XorMlp, history: TrainingHistory) -> Self {
+        Self { model, history }
+    }
+
+    /// Returns the trained XOR MLP.
+    #[must_use]
+    pub fn model(&self) -> &XorMlp {
+        &self.model
+    }
+
+    /// Returns the training history.
+    #[must_use]
+    pub fn history(&self) -> &TrainingHistory {
+        &self.history
+    }
+
+    /// Predicts positive-class probabilities.
+    pub fn predict_proba(&self, features: &Tensor) -> Result<Tensor> {
+        self.model.predict_proba(features)
+    }
+
+    /// Predicts binary classes as `0.0` or `1.0`.
+    pub fn predict_classes(&self, features: &Tensor) -> Result<Tensor> {
+        self.model.predict_classes(features)
+    }
+}
+
 /// Trains a linear layer on a supervised regression dataset using MSE and SGD.
 ///
 /// This loop intentionally keeps the gradient formula explicit so the example
@@ -345,6 +451,39 @@ pub fn train_binary_classification(
     }
 
     Ok(BinaryClassificationResult::new(model, history, threshold))
+}
+
+/// Trains a tiny sigmoid MLP on the XOR dataset using binary cross entropy.
+pub fn train_xor_mlp(config: TrainingConfig) -> Result<XorTrainingResult> {
+    let dataset = xor()?;
+    let mut model = XorMlp::new(0.5)?;
+    let mut optimizer = SGD::new(config.learning_rate())?;
+    let mut history = TrainingHistory::new();
+
+    for epoch in 1..=config.epochs() {
+        let hidden = model.hidden_activations(dataset.features())?;
+        let probabilities = sigmoid(&model.output.forward(&hidden)?)?;
+        let gradients = xor_mlp_gradients(
+            dataset.features(),
+            &hidden,
+            &probabilities,
+            dataset.targets(),
+            model.output.weights(),
+        )?;
+
+        {
+            let mut parameters = model.parameters_mut();
+            optimizer.step(&mut parameters, &gradients)?;
+        }
+
+        let updated_probabilities = model.predict_proba(dataset.features())?;
+        let loss = binary_cross_entropy(&updated_probabilities, dataset.targets())?;
+        let accuracy =
+            binary_accuracy(&updated_probabilities, dataset.targets(), model.threshold())?;
+        history.push(TrainingRecord::new(epoch, loss, Some(accuracy))?);
+    }
+
+    Ok(XorTrainingResult::new(model, history))
 }
 
 /// Computes mean squared error between two tensors.
@@ -541,6 +680,73 @@ fn logistic_binary_gradients(
     ))
 }
 
+fn xor_mlp_gradients(
+    features: &Tensor,
+    hidden: &Tensor,
+    probabilities: &Tensor,
+    targets: &Tensor,
+    output_weights: &Tensor,
+) -> Result<GradientSet> {
+    validate_rank_two("features", features)?;
+    validate_rank_two("hidden", hidden)?;
+    validate_rank_two("probabilities", probabilities)?;
+    validate_rank_two("targets", targets)?;
+    ensure_same_shape("xor targets", probabilities, targets)?;
+    validate_binary_targets(targets)?;
+
+    let rows = features.rows().expect("rank 2 tensors always have rows");
+    let input_size = features.cols().expect("rank 2 tensors always have columns");
+    let hidden_size = hidden.cols().expect("rank 2 tensors always have columns");
+    let output_size = probabilities
+        .cols()
+        .expect("rank 2 tensors always have columns");
+    if output_size != 1 {
+        return Err(RustGradError::InvalidArgument {
+            name: "probabilities",
+            reason: format!("xor mlp expects one output column, got {output_size}"),
+        });
+    }
+    if output_weights.dims() != [hidden_size, 1] {
+        return Err(RustGradError::ShapeMismatch {
+            op: "xor output weights",
+            left: vec![hidden_size, 1],
+            right: output_weights.shape().to_vec(),
+        });
+    }
+
+    let scale = 1.0 / rows as f64;
+    let mut hidden_weight_grad = vec![0.0; input_size * hidden_size];
+    let mut hidden_bias_grad = vec![0.0; hidden_size];
+    let mut output_weight_grad = vec![0.0; hidden_size];
+    let mut output_bias_grad = 0.0;
+
+    for row in 0..rows {
+        let output_delta = (probabilities.get(&[row, 0])? - targets.get(&[row, 0])?) * scale;
+        output_bias_grad += output_delta;
+
+        for hidden_col in 0..hidden_size {
+            let hidden_value = hidden.get(&[row, hidden_col])?;
+            output_weight_grad[hidden_col] += hidden_value * output_delta;
+
+            let output_weight = output_weights.get(&[hidden_col, 0])?;
+            let hidden_delta = output_delta * output_weight * hidden_value * (1.0 - hidden_value);
+            hidden_bias_grad[hidden_col] += hidden_delta;
+
+            for input_col in 0..input_size {
+                let index = input_col * hidden_size + hidden_col;
+                hidden_weight_grad[index] += features.get(&[row, input_col])? * hidden_delta;
+            }
+        }
+    }
+
+    Ok(GradientSet::from_tensors(vec![
+        Tensor::matrix(input_size, hidden_size, hidden_weight_grad)?,
+        Tensor::vector(hidden_bias_grad)?,
+        Tensor::matrix(hidden_size, 1, output_weight_grad)?,
+        Tensor::vector(vec![output_bias_grad])?,
+    ]))
+}
+
 fn validate_binary_classification_dataset(dataset: &Dataset) -> Result<()> {
     if dataset.target_size() != 1 {
         return Err(RustGradError::InvalidArgument {
@@ -663,10 +869,10 @@ fn validate_finite(name: &'static str, value: f64) -> Result<()> {
 mod tests {
     use super::{
         binary_accuracy, categorical_accuracy, mean_absolute_error, mean_squared_error,
-        train_binary_classification, train_linear_regression, TrainingConfig, TrainingHistory,
-        TrainingRecord,
+        train_binary_classification, train_linear_regression, train_xor_mlp, TrainingConfig,
+        TrainingHistory, TrainingRecord,
     };
-    use crate::data::{linear_regression, Dataset};
+    use crate::data::{linear_regression, xor, Dataset};
     use crate::tensor::Tensor;
     use crate::RustGradError;
 
@@ -1141,6 +1347,64 @@ mod tests {
                 reason: "value must be finite".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn train_xor_mlp_records_loss_and_accuracy() {
+        let config = TrainingConfig::new(30, 0.4).expect("valid config");
+
+        let result = train_xor_mlp(config).expect("training should succeed");
+
+        assert_eq!(result.history().len(), 30);
+        assert_eq!(result.history().records()[0].epoch(), 1);
+        assert_eq!(result.history().last().map(TrainingRecord::epoch), Some(30));
+        assert!(result
+            .history()
+            .records()
+            .iter()
+            .all(|record| record.accuracy().is_some()));
+        assert_eq!(result.model().hidden().weights().dims(), &[2, 2]);
+        assert_eq!(result.model().output().weights().dims(), &[2, 1]);
+    }
+
+    #[test]
+    fn train_xor_mlp_decreases_loss_and_keeps_perfect_accuracy() {
+        let config = TrainingConfig::new(120, 0.4).expect("valid config");
+
+        let result = train_xor_mlp(config).expect("training should succeed");
+
+        assert!(result.history().loss_decreased());
+        assert!(
+            result.history().final_loss().expect("final loss exists")
+                < result
+                    .history()
+                    .initial_loss()
+                    .expect("initial loss exists"),
+            "expected XOR loss to decrease, got {:?}",
+            result.history().losses()
+        );
+        assert_eq!(result.history().best_accuracy(), Some(1.0));
+    }
+
+    #[test]
+    fn xor_mlp_predicts_xor_truth_table() {
+        let config = TrainingConfig::new(160, 0.4).expect("valid config");
+        let result = train_xor_mlp(config).expect("training should succeed");
+        let dataset = xor().expect("valid xor dataset");
+
+        let probabilities = result
+            .predict_proba(dataset.features())
+            .expect("probabilities should compute");
+        let classes = result
+            .predict_classes(dataset.features())
+            .expect("classes should compute");
+
+        assert_eq!(probabilities.dims(), &[4, 1]);
+        assert_eq!(classes.data(), dataset.targets().data());
+        assert!(probabilities.get(&[0, 0]).expect("probability exists") < 0.5);
+        assert!(probabilities.get(&[1, 0]).expect("probability exists") > 0.5);
+        assert!(probabilities.get(&[2, 0]).expect("probability exists") > 0.5);
+        assert!(probabilities.get(&[3, 0]).expect("probability exists") < 0.5);
     }
 
     #[test]

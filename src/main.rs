@@ -1,5 +1,8 @@
 use rustgrad::data::{linear_regression, spiral, xor};
-use rustgrad::report::{format_progress, history_to_csv, history_to_markdown, TrainingSummary};
+use rustgrad::report::{
+    format_progress, history_to_csv, history_to_markdown, write_history_bundle, ReportBundle,
+    TrainingSummary,
+};
 use rustgrad::tensor::Tensor;
 use rustgrad::train::{
     train_linear_regression, train_spiral_classifier, train_xor_mlp, TrainingConfig,
@@ -9,6 +12,7 @@ use rustgrad::RustGradError;
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
 use std::process;
 
 type CliResult<T> = std::result::Result<T, CliError>;
@@ -60,11 +64,12 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct CommonOptions {
     epochs: usize,
     learning_rate: f64,
     format: OutputFormat,
+    output_dir: Option<PathBuf>,
 }
 
 impl CommonOptions {
@@ -73,15 +78,16 @@ impl CommonOptions {
             epochs,
             learning_rate,
             format: OutputFormat::Text,
+            output_dir: None,
         }
     }
 
-    fn config(self) -> CliResult<TrainingConfig> {
+    fn config(&self) -> CliResult<TrainingConfig> {
         Ok(TrainingConfig::new(self.epochs, self.learning_rate)?)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct LinearOptions {
     common: CommonOptions,
     samples: usize,
@@ -100,7 +106,7 @@ impl Default for LinearOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct XorOptions {
     common: CommonOptions,
 }
@@ -113,7 +119,7 @@ impl Default for XorOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SpiralOptions {
     common: CommonOptions,
     samples_per_class: usize,
@@ -172,6 +178,12 @@ fn run_train_linear(args: &[String]) -> CliResult<String> {
         result.history(),
         options.common.format,
     )?;
+    append_report_export(
+        &mut output,
+        &options.common,
+        "Linear regression training",
+        result.history(),
+    )?;
 
     if options.common.format == OutputFormat::Text {
         output.push_str(&format!(
@@ -188,6 +200,12 @@ fn run_train_xor(args: &[String]) -> CliResult<String> {
     let options = parse_xor_options(args)?;
     let result = train_xor_mlp(options.common.config()?)?;
     let mut output = render_history("XOR MLP training", result.history(), options.common.format)?;
+    append_report_export(
+        &mut output,
+        &options.common,
+        "XOR MLP training",
+        result.history(),
+    )?;
 
     if options.common.format == OutputFormat::Text {
         let dataset = xor()?;
@@ -213,6 +231,12 @@ fn run_train_spiral(args: &[String]) -> CliResult<String> {
         "Spiral softmax training",
         result.history(),
         options.common.format,
+    )?;
+    append_report_export(
+        &mut output,
+        &options.common,
+        "Spiral softmax training",
+        result.history(),
     )?;
 
     if options.common.format == OutputFormat::Text {
@@ -289,6 +313,10 @@ fn parse_linear_options(args: &[String]) -> CliResult<LinearOptions> {
                 options.common.format =
                     OutputFormat::parse(take_value(args, &mut index, "--format")?)?;
             }
+            "--output" => {
+                options.common.output_dir =
+                    Some(PathBuf::from(take_value(args, &mut index, "--output")?));
+            }
             "--samples" => {
                 options.samples = parse_usize(take_value(args, &mut index, "--samples")?)?;
             }
@@ -323,6 +351,10 @@ fn parse_xor_options(args: &[String]) -> CliResult<XorOptions> {
                 options.common.format =
                     OutputFormat::parse(take_value(args, &mut index, "--format")?)?;
             }
+            "--output" => {
+                options.common.output_dir =
+                    Some(PathBuf::from(take_value(args, &mut index, "--output")?));
+            }
             flag => return Err(unknown_flag("train-xor", flag)),
         }
         index += 1;
@@ -347,6 +379,10 @@ fn parse_spiral_options(args: &[String]) -> CliResult<SpiralOptions> {
             "--format" => {
                 options.common.format =
                     OutputFormat::parse(take_value(args, &mut index, "--format")?)?;
+            }
+            "--output" => {
+                options.common.output_dir =
+                    Some(PathBuf::from(take_value(args, &mut index, "--output")?));
             }
             "--samples-per-class" => {
                 options.samples_per_class =
@@ -396,6 +432,32 @@ fn render_history(
         OutputFormat::Csv => Ok(history_to_csv(history)?),
         OutputFormat::Markdown => Ok(history_to_markdown(title, history)?),
     }
+}
+
+fn append_report_export(
+    output: &mut String,
+    options: &CommonOptions,
+    title: &str,
+    history: &TrainingHistory,
+) -> CliResult<()> {
+    if let Some(directory) = &options.output_dir {
+        let bundle = write_history_bundle(directory, title, history)?;
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&format_report_bundle(&bundle));
+    }
+
+    Ok(())
+}
+
+fn format_report_bundle(bundle: &ReportBundle) -> String {
+    format!(
+        "report_dir={}\nmarkdown={}\ncsv={}",
+        bundle.directory().display(),
+        bundle.markdown_path().display(),
+        bundle.csv_path().display()
+    )
 }
 
 fn render_text_summary(title: &str, history: &TrainingHistory) -> CliResult<String> {
@@ -450,9 +512,9 @@ fn help_text() -> String {
         format!("rustgrad {}", rustgrad::version()),
         String::from(""),
         String::from("Usage:"),
-        String::from("  rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown]"),
-        String::from("  rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown]"),
-        String::from("  rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown]"),
+        String::from("  rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown] [--output DIR]"),
+        String::from("  rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown] [--output DIR]"),
+        String::from("  rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown] [--output DIR]"),
         String::from("  rustgrad inspect"),
         String::from("  rustgrad --version"),
     ]
@@ -462,9 +524,20 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{execute, parse_linear_options, parse_spiral_options, OutputFormat};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn run(args: &[&str]) -> String {
         execute(args.iter().map(|arg| (*arg).to_string())).expect("command should succeed")
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustgrad-cli-{name}-{suffix}"))
     }
 
     #[test]
@@ -499,6 +572,8 @@ mod tests {
             "-1.0".to_string(),
             "--format".to_string(),
             "csv".to_string(),
+            "--output".to_string(),
+            "runs/linear-demo".to_string(),
         ];
 
         let options = parse_linear_options(&args).expect("options should parse");
@@ -509,6 +584,10 @@ mod tests {
         assert_eq!(options.samples, 5);
         assert_eq!(options.slope, 2.5);
         assert_eq!(options.intercept, -1.0);
+        assert_eq!(
+            options.common.output_dir,
+            Some(PathBuf::from("runs/linear-demo"))
+        );
     }
 
     #[test]
@@ -573,6 +652,34 @@ mod tests {
 
         assert!(output.starts_with("epoch,loss,accuracy\n"));
         assert!(output.lines().count() == 4);
+    }
+
+    #[test]
+    fn train_xor_command_writes_report_bundle_when_output_is_set() {
+        let directory = unique_temp_dir("xor-output");
+        let directory_arg = directory.to_string_lossy().to_string();
+
+        let output = run(&[
+            "train-xor",
+            "--epochs",
+            "5",
+            "--output",
+            directory_arg.as_str(),
+        ]);
+
+        assert!(output.contains("report_dir="));
+        assert!(output.contains("summary.md"));
+        assert!(output.contains("history.csv"));
+
+        let markdown = fs::read_to_string(directory.join("summary.md")).expect("markdown exists");
+        let csv = fs::read_to_string(directory.join("history.csv")).expect("csv exists");
+
+        assert!(markdown.starts_with("# XOR MLP training"));
+        assert!(markdown.contains("## Summary"));
+        assert!(csv.starts_with("epoch,loss,accuracy\n"));
+        assert_eq!(csv.lines().count(), 6);
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
     }
 
     #[test]

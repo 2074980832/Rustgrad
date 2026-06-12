@@ -464,16 +464,21 @@ fn validate_finite(name: &'static str, value: f64) -> Result<()> {
 mod tests {
     use super::{
         binary_accuracy, categorical_accuracy, mean_absolute_error, mean_squared_error,
-        TrainingConfig, TrainingHistory, TrainingRecord,
+        train_linear_regression, TrainingConfig, TrainingHistory, TrainingRecord,
     };
+    use crate::data::{linear_regression, Dataset};
     use crate::tensor::Tensor;
     use crate::RustGradError;
 
     const EPSILON: f64 = 1e-12;
 
     fn assert_close(actual: f64, expected: f64) {
+        assert_close_with(actual, expected, EPSILON);
+    }
+
+    fn assert_close_with(actual: f64, expected: f64, tolerance: f64) {
         assert!(
-            (actual - expected).abs() < EPSILON,
+            (actual - expected).abs() < tolerance,
             "expected {expected}, got {actual}"
         );
     }
@@ -649,6 +654,142 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history.best_loss(), Some(0.8));
         assert!(!history.loss_decreased());
+    }
+
+    #[test]
+    fn train_linear_regression_records_one_loss_per_epoch() {
+        let dataset = linear_regression(9, 2.0, 1.0).expect("valid dataset");
+        let config = TrainingConfig::new(12, 0.1).expect("valid config");
+
+        let result = train_linear_regression(&dataset, config).expect("training should succeed");
+
+        assert_eq!(result.history().len(), 12);
+        assert_eq!(result.history().records()[0].epoch(), 1);
+        assert_eq!(result.history().last().map(TrainingRecord::epoch), Some(12));
+        assert!(result
+            .history()
+            .records()
+            .iter()
+            .all(|record| record.accuracy().is_none()));
+    }
+
+    #[test]
+    fn train_linear_regression_decreases_loss_on_simple_line() {
+        let dataset = linear_regression(21, 2.0, -0.5).expect("valid dataset");
+        let config = TrainingConfig::new(80, 0.15).expect("valid config");
+
+        let result = train_linear_regression(&dataset, config).expect("training should succeed");
+        let history = result.history();
+
+        assert!(history.loss_decreased());
+        assert!(
+            history.final_loss().expect("final loss exists")
+                < history.initial_loss().expect("initial loss exists") * 0.05,
+            "expected strong loss decrease, got {:?}",
+            history.losses()
+        );
+        assert!(history.best_loss().expect("best loss exists") <= history.final_loss().unwrap());
+    }
+
+    #[test]
+    fn train_linear_regression_learns_slope_and_intercept() {
+        let dataset = linear_regression(31, 1.5, 0.75).expect("valid dataset");
+        let config = TrainingConfig::new(160, 0.12).expect("valid config");
+
+        let result = train_linear_regression(&dataset, config).expect("training should succeed");
+
+        assert_close_with(
+            result
+                .model()
+                .weights()
+                .get(&[0, 0])
+                .expect("weight exists"),
+            1.5,
+            1e-4,
+        );
+        assert_close_with(
+            result.model().bias().get_flat(0).expect("bias exists"),
+            0.75,
+            1e-4,
+        );
+        assert!(
+            result.history().final_loss().expect("final loss exists") < 1e-6,
+            "expected tiny final loss, got {:?}",
+            result.history().final_loss()
+        );
+    }
+
+    #[test]
+    fn linear_regression_result_predicts_with_trained_model() {
+        let dataset = linear_regression(25, -3.0, 2.0).expect("valid dataset");
+        let config = TrainingConfig::new(180, 0.1).expect("valid config");
+        let result = train_linear_regression(&dataset, config).expect("training should succeed");
+        let inputs = Tensor::matrix(3, 1, vec![-1.0, 0.0, 1.0]).expect("valid input");
+
+        let predictions = result.predict(&inputs).expect("prediction should succeed");
+
+        assert_eq!(predictions.dims(), &[3, 1]);
+        assert_close_with(
+            predictions.get(&[0, 0]).expect("prediction exists"),
+            5.0,
+            1e-4,
+        );
+        assert_close_with(
+            predictions.get(&[1, 0]).expect("prediction exists"),
+            2.0,
+            1e-4,
+        );
+        assert_close_with(
+            predictions.get(&[2, 0]).expect("prediction exists"),
+            -1.0,
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn train_linear_regression_supports_multiple_outputs() {
+        let dataset = Dataset::new(
+            "multi-output",
+            Tensor::matrix(4, 1, vec![-1.0, 0.0, 1.0, 2.0]).expect("valid features"),
+            Tensor::matrix(4, 2, vec![-1.0, 3.0, 1.0, 1.0, 3.0, -1.0, 5.0, -3.0])
+                .expect("valid targets"),
+        )
+        .expect("valid dataset");
+        let config = TrainingConfig::new(220, 0.08).expect("valid config");
+
+        let result = train_linear_regression(&dataset, config).expect("training should succeed");
+
+        assert_eq!(result.model().weights().dims(), &[1, 2]);
+        assert_eq!(result.model().bias().dims(), &[2]);
+        assert_close_with(
+            result
+                .model()
+                .weights()
+                .get(&[0, 0])
+                .expect("weight exists"),
+            2.0,
+            1e-4,
+        );
+        assert_close_with(
+            result
+                .model()
+                .weights()
+                .get(&[0, 1])
+                .expect("weight exists"),
+            -2.0,
+            1e-4,
+        );
+        assert_close_with(
+            result.model().bias().get_flat(0).expect("bias exists"),
+            1.0,
+            1e-4,
+        );
+        assert_close_with(
+            result.model().bias().get_flat(1).expect("bias exists"),
+            1.0,
+            1e-4,
+        );
+        assert!(result.history().final_loss().expect("final loss exists") < 1e-6);
     }
 
     #[test]

@@ -538,10 +538,10 @@ pub fn train_xor_mlp(config: TrainingConfig) -> Result<XorTrainingResult> {
 
 /// Trains a softmax classifier on the deterministic spiral dataset.
 ///
-/// The raw spiral is not linearly separable in `(x, y)`. This teaching example
-/// uses a compact polar feature map before a linear softmax head, making the
-/// training loop easy to inspect while still demonstrating a non-linear
-/// classification workflow.
+/// The raw spiral is not linearly separable in `(x, y)`. This course-project
+/// example uses a compact polar feature map before a linear softmax head,
+/// making the training loop easy to inspect while still demonstrating a
+/// non-linear classification workflow.
 pub fn train_spiral_classifier(
     samples_per_class: usize,
     classes: usize,

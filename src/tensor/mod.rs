@@ -468,6 +468,34 @@ impl Tensor {
         self.elementwise_binary(rhs, "div", |left, right| left / right)
     }
 
+    /// Adds a bias vector to each row of a matrix.
+    ///
+    /// `self` must be rank 2 with shape [rows, cols]; `bias` must be rank 1
+    /// with shape [cols].
+    pub fn row_add(&self, bias: &Self) -> Result<Self> {
+        let rows = self.rows().ok_or_else(|| RustGradError::InvalidArgument {
+            name: "left",
+            reason: format!("row_add expects rank 2 left, got rank {}", self.rank()),
+        })?;
+        let cols = self.cols().expect("rank 2 tensors always have columns");
+
+        if !bias.shape().is_vector() || bias.len() != cols {
+            return Err(RustGradError::ShapeMismatch {
+                op: "row_add bias",
+                left: vec![cols],
+                right: bias.shape().to_vec(),
+            });
+        }
+
+        let mut data = self.data.clone();
+        for row in 0..rows {
+            for col in 0..cols {
+                data[row * cols + col] += bias.get_flat(col)?;
+            }
+        }
+        Tensor::matrix(rows, cols, data)
+    }
+
     fn elementwise_binary(
         &self,
         rhs: &Self,

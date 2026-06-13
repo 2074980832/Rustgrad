@@ -44,6 +44,8 @@ pub enum Operation {
     Sum,
     /// Mean reduction.
     Mean,
+    /// Add a vector to each row of a matrix.
+    RowAdd,
     /// Rectified linear unit activation.
     Relu,
     /// Sigmoid activation.
@@ -70,6 +72,7 @@ impl Operation {
             Self::Transpose => "transpose",
             Self::Sum => "sum",
             Self::Mean => "mean",
+            Self::RowAdd => "row_add",
             Self::Relu => "relu",
             Self::Sigmoid => "sigmoid",
             Self::Tanh => "tanh",
@@ -279,9 +282,27 @@ impl ComputationGraph {
     /// implemented incrementally; unsupported non-leaf operations return a
     /// clear error instead of silently producing incorrect gradients.
     pub fn backward(&mut self, output: NodeId) -> Result<()> {
+        self.backward_with_grad(output, Tensor::ones(
+            self.node(output)
+                .ok_or_else(|| RustGradError::InvalidArgument {
+                    name: "node",
+                    reason: format!("node {} does not exist", output.index()),
+                })?
+                .value()
+                .shape()
+                .to_vec(),
+        )?)
+    }
+
+    /// Runs a backward pass from the output, seeding with an explicit gradient.
+    ///
+    /// This allows combining manual loss gradient computation with the autograd
+    /// engine: compute `dL/dy` by hand, then call `backward_with_grad(y, dL_dy)`
+    /// to propagate through the computation graph.
+    pub fn backward_with_grad(&mut self, output: NodeId, seed: Tensor) -> Result<()> {
         let order = self.topological_order(output)?;
         self.clear_gradients();
-        self.seed_output_gradient(output)?;
+        self.accumulate_node_grad(output, seed)?;
 
         for node_id in order.into_iter().rev() {
             let Some(grad) = self.node(node_id).and_then(|node| node.grad()).cloned() else {
@@ -353,18 +374,16 @@ impl ComputationGraph {
         Ok(())
     }
 
-    fn seed_output_gradient(&mut self, output: NodeId) -> Result<()> {
-        let shape = self
-            .node(output)
-            .ok_or_else(|| RustGradError::InvalidArgument {
-                name: "node",
-                reason: format!("node {} does not exist", output.index()),
-            })?
-            .value()
-            .shape()
-            .to_vec();
-        let grad = Tensor::ones(shape)?;
-        self.accumulate_node_grad(output, grad)
+    /// Removes and returns raw Tensors for accumulated gradients of leaf
+    /// nodes whose `requires_grad` is true, in node-ID order.
+    ///
+    /// This is useful for feeding optimizer steps after `backward_with_grad`.
+    pub fn take_gradients(&mut self) -> Vec<Tensor> {
+        self.nodes
+            .iter_mut()
+            .filter(|n| n.requires_grad() && n.operation_kind() == &Operation::Leaf)
+            .filter_map(|n| n.take_grad())
+            .collect()
     }
 
     fn accumulate_node_grad(&mut self, id: NodeId, grad: Tensor) -> Result<()> {
@@ -393,6 +412,7 @@ impl ComputationGraph {
             Operation::MatMul => self.matmul_gradients(node.parents(), upstream_grad),
             Operation::Sum => self.sum_gradient(node.parents(), upstream_grad),
             Operation::Mean => self.mean_gradient(node.parents(), upstream_grad),
+            Operation::RowAdd => self.row_add_gradients(node.parents(), upstream_grad),
             Operation::Transpose => self.transpose_gradient(node.parents(), upstream_grad),
             Operation::Relu => self.relu_gradient(node.parents(), upstream_grad),
             Operation::Sigmoid => self.sigmoid_gradient(node.parents(), node.value(), upstream_grad),
@@ -533,6 +553,20 @@ impl ComputationGraph {
         let grad = Self::broadcast_reduction_gradient(&parent_value, upstream_grad, scale)?;
 
         Ok(vec![(parent_id, grad)])
+    }
+
+    fn row_add_gradients(
+        &self,
+        parents: &[NodeId],
+        upstream_grad: &Tensor,
+    ) -> Result<Vec<(NodeId, Tensor)>> {
+        let (left_id, left_value, right_id, _right_value) =
+            self.binary_parent_values(parents, "row_add")?;
+        // Matrix grad: upstream passes through unchanged.
+        let left_grad = Self::fit_gradient_to_parent(&left_value, upstream_grad.clone())?;
+        // Bias grad: sum upstream over rows.
+        let right_grad = upstream_grad.sum_axis(0)?;
+        Ok(vec![(left_id, left_grad), (right_id, right_grad)])
     }
 
     fn transpose_gradient(
@@ -1687,6 +1721,7 @@ mod tests {
             Operation::Sigmoid => crate::nn::sigmoid(&get_val(0)?),
             Operation::Tanh => crate::nn::tanh(&get_val(0)?),
             Operation::Softmax => crate::nn::softmax(&get_val(0)?),
+            Operation::RowAdd => get_val(0)?.row_add(&get_val(1)?),
             _ => Err(RustGradError::UnsupportedOperation {
                 op: op.name().to_string(),
                 reason: "finite-difference recomputation not supported".to_string(),

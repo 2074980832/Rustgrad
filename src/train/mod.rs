@@ -1,5 +1,6 @@
 //! Reusable training loops and training metrics.
 
+use crate::autograd::{ComputationGraph, Operation};
 use crate::data::{spiral, xor, Dataset};
 use crate::loss::{CrossEntropyLoss, Loss};
 use crate::nn::{sigmoid, softmax, Linear, Module};
@@ -435,10 +436,9 @@ impl SpiralTrainingResult {
 
 /// Trains a linear layer on a supervised regression dataset using MSE and SGD.
 ///
-/// This loop intentionally keeps the gradient formula explicit so the example
-/// remains easy to inspect in reports: it computes the MSE gradient for
-/// `output = input @ weights + bias`, then delegates the parameter update to
-/// the optimizer module.
+/// Builds a computation graph each epoch, computes MSE loss manually, then
+/// seeds the autograd engine with the MSE gradient to propagate into weights
+/// and bias.
 pub fn train_linear_regression(
     dataset: &Dataset,
     config: TrainingConfig,
@@ -446,20 +446,61 @@ pub fn train_linear_regression(
     let mut model = Linear::new(dataset.input_size(), dataset.target_size())?;
     let mut optimizer = SGD::new(config.learning_rate())?;
     let mut history = TrainingHistory::new();
+    let features = dataset.features();
+    let targets = dataset.targets();
 
     for epoch in 1..=config.epochs() {
-        let predictions = model.forward(dataset.features())?;
-        let (weight_grad, bias_grad) =
-            linear_mse_gradients(dataset.features(), &predictions, dataset.targets())?;
-        let gradients = GradientSet::from_tensors(vec![weight_grad, bias_grad]);
+        let (weight_grad, bias_grad) = {
+            let mut graph = ComputationGraph::new();
+            // Constant leaves: features.
+            let f_node = graph.add_leaf(features.clone(), false);
+            // Trainable leaves: weights, bias.
+            let trainable = model.parameters();
+            let w_node = graph.add_leaf(trainable[0].clone(), true);
+            let b_node = graph.add_leaf(trainable[1].clone(), true);
+
+            // predictions = features @ weights
+            let matmul_val = features.matmul(trainable[0])?;
+            let matmul_node = graph.add_operation(
+                Operation::MatMul,
+                vec![f_node, w_node],
+                matmul_val,
+                true,
+            )?;
+            // predictions = matmul + bias (row_add)
+            let pred_val = graph.node(matmul_node).expect("exists").value().row_add(trainable[1])?;
+            let n = pred_val.len() as f64;
+            let pred_shape = pred_val.shape().to_vec();
+            let pred_data = pred_val.data().to_vec();
+            let pred_node = graph.add_operation(
+                Operation::RowAdd,
+                vec![matmul_node, b_node],
+                pred_val,
+                true,
+            )?;
+
+            // MSE gradient: dL/dy = (2/N) * (y - target)
+            let scale = 2.0 / n;
+            let init_grad_data: Vec<f64> = pred_data
+                .iter()
+                .zip(targets.data())
+                .map(|(&p, &t)| scale * (p - t))
+                .collect();
+            let init_grad = Tensor::from_vec(pred_shape, init_grad_data)?;
+            graph.backward_with_grad(pred_node, init_grad)?;
+
+            let grads = graph.take_gradients();
+            (grads[0].clone(), grads[1].clone())
+        };
 
         {
+            let gradients = GradientSet::from_tensors(vec![weight_grad, bias_grad]);
             let mut parameters = model.parameters_mut();
             optimizer.step(&mut parameters, &gradients)?;
         }
 
-        let updated_predictions = model.forward(dataset.features())?;
-        let loss = mean_squared_error(&updated_predictions, dataset.targets())?;
+        let predictions = model.forward(features)?;
+        let loss = mean_squared_error(&predictions, targets)?;
         history.push(TrainingRecord::new(epoch, loss, None)?);
     }
 
@@ -468,8 +509,8 @@ pub fn train_linear_regression(
 
 /// Trains a logistic regression classifier using binary cross entropy and SGD.
 ///
-/// Targets must be a single-column matrix containing `0.0` or `1.0`. The
-/// recorded accuracy is computed from probabilities after each update.
+/// Builds a computation graph each epoch, seeds the logits node with the
+/// sigmoid+BCE combined gradient `(p - t) / N`, and propagates to weights.
 pub fn train_binary_classification(
     dataset: &Dataset,
     config: TrainingConfig,
@@ -481,22 +522,55 @@ pub fn train_binary_classification(
     let mut model = Linear::new(dataset.input_size(), 1)?;
     let mut optimizer = SGD::new(config.learning_rate())?;
     let mut history = TrainingHistory::new();
+    let features = dataset.features();
+    let targets = dataset.targets();
 
     for epoch in 1..=config.epochs() {
-        let logits = model.forward(dataset.features())?;
-        let probabilities = sigmoid(&logits)?;
-        let (weight_grad, bias_grad) =
-            logistic_binary_gradients(dataset.features(), &probabilities, dataset.targets())?;
-        let gradients = GradientSet::from_tensors(vec![weight_grad, bias_grad]);
+        let (weight_grad, bias_grad) = {
+            let mut graph = ComputationGraph::new();
+            let f_node = graph.add_leaf(features.clone(), false);
+            let trainable = model.parameters();
+            let w_node = graph.add_leaf(trainable[0].clone(), true);
+            let b_node = graph.add_leaf(trainable[1].clone(), true);
+
+            let matmul_val = features.matmul(trainable[0])?;
+            let matmul_node = graph.add_operation(
+                Operation::MatMul, vec![f_node, w_node], matmul_val, true,
+            )?;
+            let logits_val = graph.node(matmul_node).expect("exists").value().row_add(trainable[1])?;
+            let n = logits_val.len() as f64;
+            let logits_node = graph.add_operation(
+                Operation::RowAdd, vec![matmul_node, b_node], logits_val, true,
+            )?;
+
+            // sigmoid + BCE combined: dL/dlogits = (sigma(logits) - t) / N
+            let logits_data = graph.node(logits_node).expect("exists").value().data().to_vec();
+            let logits_shape = graph.node(logits_node).expect("exists").value().shape().to_vec();
+            let scale = 1.0 / n;
+            let init_grad_data: Vec<f64> = logits_data
+                .iter()
+                .zip(targets.data())
+                .map(|(&l, &t)| {
+                    let p = 1.0 / (1.0 + (-l).exp());
+                    scale * (p - t)
+                })
+                .collect();
+            let init_grad = Tensor::from_vec(logits_shape, init_grad_data)?;
+            graph.backward_with_grad(logits_node, init_grad)?;
+
+            let grads = graph.take_gradients();
+            (grads[0].clone(), grads[1].clone())
+        };
 
         {
+            let gradients = GradientSet::from_tensors(vec![weight_grad, bias_grad]);
             let mut parameters = model.parameters_mut();
             optimizer.step(&mut parameters, &gradients)?;
         }
 
-        let updated_probabilities = sigmoid(&model.forward(dataset.features())?)?;
-        let loss = binary_cross_entropy(&updated_probabilities, dataset.targets())?;
-        let accuracy = binary_accuracy(&updated_probabilities, dataset.targets(), threshold)?;
+        let probabilities = sigmoid(&model.forward(features)?)?;
+        let loss = binary_cross_entropy(&probabilities, targets)?;
+        let accuracy = binary_accuracy(&probabilities, targets, threshold)?;
         history.push(TrainingRecord::new(epoch, loss, Some(accuracy))?);
     }
 
@@ -504,32 +578,84 @@ pub fn train_binary_classification(
 }
 
 /// Trains a tiny sigmoid MLP on the XOR dataset using binary cross entropy.
+///
+/// Builds a full computation graph with hidden sigmoid each epoch, then seeds
+/// the output logits node with the sigmoid+BCE combined gradient.
 pub fn train_xor_mlp(config: TrainingConfig) -> Result<XorTrainingResult> {
     let dataset = xor()?;
     let mut model = XorMlp::new(0.5)?;
     let mut optimizer = SGD::new(config.learning_rate())?;
     let mut history = TrainingHistory::new();
+    let features = dataset.features();
+    let targets = dataset.targets();
 
     for epoch in 1..=config.epochs() {
-        let hidden = model.hidden_activations(dataset.features())?;
-        let probabilities = sigmoid(&model.output.forward(&hidden)?)?;
-        let gradients = xor_mlp_gradients(
-            dataset.features(),
-            &hidden,
-            &probabilities,
-            dataset.targets(),
-            model.output.weights(),
-        )?;
+        let grads = {
+            let mut graph = ComputationGraph::new();
+            // Collect trainable parameters in order.
+            let hidden_params = model.hidden().parameters();
+            let output_params = model.output().parameters();
+            let params: Vec<&Tensor> = hidden_params.iter()
+                .chain(output_params.iter()).copied().collect();
+
+            let f_node = graph.add_leaf(features.clone(), false);
+            let hw_node = graph.add_leaf(params[0].clone(), true);  // hidden weights
+            let hb_node = graph.add_leaf(params[1].clone(), true);  // hidden bias
+            let ow_node = graph.add_leaf(params[2].clone(), true);  // output weights
+            let ob_node = graph.add_leaf(params[3].clone(), true);  // output bias
+
+            // Hidden: matmul -> row_add -> sigmoid
+            let h_matmul_val = features.matmul(params[0])?;
+            let h_matmul = graph.add_operation(
+                Operation::MatMul, vec![f_node, hw_node], h_matmul_val, true,
+            )?;
+            let h_biased_val = graph.node(h_matmul).expect("exists").value().row_add(params[1])?;
+            let h_biased = graph.add_operation(
+                Operation::RowAdd, vec![h_matmul, hb_node], h_biased_val, true,
+            )?;
+            let hidden_val = sigmoid(graph.node(h_biased).expect("exists").value())?;
+            let hidden_node = graph.add_operation(
+                Operation::Sigmoid, vec![h_biased], hidden_val, true,
+            )?;
+
+            // Output: matmul -> row_add (logits, then sigmoid manually)
+            let o_matmul_val = graph.node(hidden_node).expect("exists").value().matmul(params[2])?;
+            let o_matmul = graph.add_operation(
+                Operation::MatMul, vec![hidden_node, ow_node], o_matmul_val, true,
+            )?;
+            let logits_val = graph.node(o_matmul).expect("exists").value().row_add(params[3])?;
+            let n = logits_val.len() as f64;
+            let logits_shape = logits_val.shape().to_vec();
+            let logits_data = logits_val.data().to_vec();
+            let logits_node = graph.add_operation(
+                Operation::RowAdd, vec![o_matmul, ob_node], logits_val, true,
+            )?;
+
+            // sigmoid + BCE combined: dL/dlogits = (sigma(logits) - t) / N
+            let scale = 1.0 / n;
+            let init_grad_data: Vec<f64> = logits_data
+                .iter()
+                .zip(targets.data())
+                .map(|(&l, &t)| {
+                    let p = 1.0 / (1.0 + (-l).exp());
+                    scale * (p - t)
+                })
+                .collect();
+            let init_grad = Tensor::from_vec(logits_shape, init_grad_data)?;
+            graph.backward_with_grad(logits_node, init_grad)?;
+
+            graph.take_gradients()
+        };
 
         {
+            let gradients = GradientSet::from_tensors(grads);
             let mut parameters = model.parameters_mut();
             optimizer.step(&mut parameters, &gradients)?;
         }
 
-        let updated_probabilities = model.predict_proba(dataset.features())?;
-        let loss = binary_cross_entropy(&updated_probabilities, dataset.targets())?;
-        let accuracy =
-            binary_accuracy(&updated_probabilities, dataset.targets(), model.threshold())?;
+        let probabilities = model.predict_proba(features)?;
+        let loss = binary_cross_entropy(&probabilities, targets)?;
+        let accuracy = binary_accuracy(&probabilities, targets, model.threshold())?;
         history.push(TrainingRecord::new(epoch, loss, Some(accuracy))?);
     }
 
@@ -538,10 +664,8 @@ pub fn train_xor_mlp(config: TrainingConfig) -> Result<XorTrainingResult> {
 
 /// Trains a softmax classifier on the deterministic spiral dataset.
 ///
-/// The raw spiral is not linearly separable in `(x, y)`. This course-project
-/// example uses a compact polar feature map before a linear softmax head,
-/// making the training loop easy to inspect while still demonstrating a
-/// non-linear classification workflow.
+/// Builds a computation graph each epoch, puts softmax in the graph, then seeds
+/// with the softmax+CE combined gradient `(softmax(logits) - targets) / N`.
 pub fn train_spiral_classifier(
     samples_per_class: usize,
     classes: usize,
@@ -558,24 +682,56 @@ pub fn train_spiral_classifier(
     let mut optimizer = SGD::new(config.learning_rate())?;
     let loss = CrossEntropyLoss::new();
     let mut history = TrainingHistory::new();
+    let features = &mapped_features;
+    let targets = dataset.targets();
 
     for epoch in 1..=config.epochs() {
-        let logits = model.forward(&mapped_features)?;
-        let probabilities = softmax(&logits)?;
-        let gradients =
-            softmax_cross_entropy_gradients(&mapped_features, &probabilities, dataset.targets())?;
+        let (weight_grad, bias_grad) = {
+            let mut graph = ComputationGraph::new();
+            let f_node = graph.add_leaf(features.clone(), false);
+            let trainable = model.parameters();
+            let w_node = graph.add_leaf(trainable[0].clone(), true);
+            let b_node = graph.add_leaf(trainable[1].clone(), true);
+
+            let matmul_val = features.matmul(trainable[0])?;
+            let matmul_node = graph.add_operation(
+                Operation::MatMul, vec![f_node, w_node], matmul_val, true,
+            )?;
+            let logits_val = graph.node(matmul_node).expect("exists").value().row_add(trainable[1])?;
+            let n = logits_val.rows().expect("matrix rows") as f64;
+            let logits_shape = logits_val.shape().to_vec();
+            let logits_node = graph.add_operation(
+                Operation::RowAdd, vec![matmul_node, b_node], logits_val, true,
+            )?;
+
+            // softmax + CE combined: dL/dlogits = (softmax(logits) - targets) / N
+            let sm = softmax(graph.node(logits_node).expect("exists").value())?;
+            let scale = 1.0 / n;
+            let init_grad_data: Vec<f64> = sm
+                .data()
+                .iter()
+                .zip(targets.data())
+                .map(|(&p, &t)| scale * (p - t))
+                .collect();
+            let init_grad = Tensor::from_vec(logits_shape, init_grad_data)?;
+            graph.backward_with_grad(logits_node, init_grad)?;
+
+            let grads = graph.take_gradients();
+            (grads[0].clone(), grads[1].clone())
+        };
 
         {
+            let gradients = GradientSet::from_tensors(vec![weight_grad, bias_grad]);
             let mut parameters = model.parameters_mut();
             optimizer.step(&mut parameters, &gradients)?;
         }
 
-        let updated_logits = model.forward(&mapped_features)?;
+        let updated_logits = model.forward(features)?;
         let updated_probabilities = softmax(&updated_logits)?;
         let epoch_loss = loss
-            .forward(&updated_logits, dataset.targets())?
+            .forward(&updated_logits, targets)?
             .get_flat(0)?;
-        let accuracy = categorical_accuracy(&updated_probabilities, dataset.targets())?;
+        let accuracy = categorical_accuracy(&updated_probabilities, targets)?;
         history.push(TrainingRecord::new(epoch, epoch_loss, Some(accuracy))?);
     }
 
@@ -712,6 +868,7 @@ fn probabilities_to_one_hot(probabilities: &Tensor) -> Result<Tensor> {
 
     Tensor::matrix(rows, cols, data)
 }
+
 
 fn linear_mse_gradients(
     features: &Tensor,

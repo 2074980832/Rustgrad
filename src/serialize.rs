@@ -78,6 +78,12 @@ pub fn read_tensor(input: &str) -> Result<(Tensor, usize)> {
 
 /// Saves a linear layer to a file.
 pub fn save_linear(linear: &Linear, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| RustGradError::InvalidArgument {
+            name: "path",
+            reason: format!("failed to create parent directory: {e}"),
+        })?;
+    }
     let mut content = String::new();
     write_tensor(linear.weights(), &mut content);
     write_tensor(linear.bias(), &mut content);
@@ -102,6 +108,12 @@ pub fn load_linear(path: &Path) -> Result<Linear> {
 
 /// Saves a two-layer XOR MLP to a file.
 pub fn save_xor_mlp(model: &XorMlp, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| RustGradError::InvalidArgument {
+            name: "path",
+            reason: format!("failed to create parent directory: {e}"),
+        })?;
+    }
     let mut content = String::new();
     write_tensor(model.hidden().weights(), &mut content);
     write_tensor(model.hidden().bias(), &mut content);

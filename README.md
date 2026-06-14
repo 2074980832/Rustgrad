@@ -57,9 +57,13 @@ tests/
   coverage, reproducibility, and Windows notes.
 - [Technical report](docs/experiment-report.md): bilingual course report that
   connects the architecture, implementation, validation, and limits.
-- [Development report (中文)](report.md): 0.2.0 development report covering all
-  new features, test statistics, and known limits.
+- [Project report (中文)](report.md): comprehensive project report covering
+  architecture, all module deep dives, design decisions, quality strategy, and
+  known limits.
 - [Changelog](CHANGELOG.md): project milestone summary and known limits.
+- [Defense preparation (中文)](defense.md): PPT structure, presentation script,
+  and anticipated Q&A for course defense.
+- [PlantUML diagrams](diagrams/): 8 architecture diagrams for PPT slides.
 
 ## Quick Start
 
@@ -93,6 +97,12 @@ The `--output` directory receives:
 - `summary.md`: Markdown summary with training metrics and history table.
 - `history.csv`: CSV loss and accuracy curve for plotting or reports.
 
+Save trained model weights to a plain-text checkpoint:
+
+```bash
+cargo run -- train-xor --epochs 160 --save-model runs/xor.checkpoint
+```
+
 Inspect a compact snapshot of trained example models:
 
 ```bash
@@ -119,14 +129,14 @@ Output formats:
 
 ```text
 XOR MLP training
-epochs=5
+epochs=160
 initial_loss=0.242958
-final_loss=0.232110
-best_loss=0.232110
-loss_improvement=0.010848
+final_loss=0.150075
+best_loss=0.150075
+loss_improvement=0.092884
 best_accuracy=1.000000
-last=epoch=5 loss=0.232110 accuracy=1.000000
-probabilities=[0.205530]; [0.791871]; [0.791871]; [0.206772]
+last=epoch=160 loss=0.150075 accuracy=1.000000
+probabilities=[0.155609]; [0.879026]; [0.879026]; [0.159095]
 classes=[0.000000]; [1.000000]; [1.000000]; [0.000000]
 ```
 

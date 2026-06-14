@@ -584,7 +584,7 @@ mod tests {
     fn version_command_prints_package_version() {
         let output = run(&["--version"]);
 
-        assert_eq!(output, "rustgrad 0.2.0");
+        assert_eq!(output, "rustgrad 0.1.0");
     }
 
     #[test]

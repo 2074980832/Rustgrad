@@ -57,13 +57,7 @@ tests/
   coverage, reproducibility, and Windows notes.
 - [Technical report](docs/experiment-report.md): bilingual course report that
   connects the architecture, implementation, validation, and limits.
-- [Project report (中文)](report.md): comprehensive project report covering
-  architecture, all module deep dives, design decisions, quality strategy, and
-  known limits.
 - [Changelog](CHANGELOG.md): project milestone summary and known limits.
-- [Defense preparation (中文)](defense.md): PPT structure, presentation script,
-  and anticipated Q&A for course defense.
-- [PlantUML diagrams](diagrams/): 8 architecture diagrams for PPT slides.
 
 ## Quick Start
 

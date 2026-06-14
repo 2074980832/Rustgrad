@@ -15,29 +15,33 @@ inspected, tested, and explained clearly in a course report.
 
 | Area | Functionality |
 | --- | --- |
-| Tensor | Shape validation, indexing, reshape, arithmetic, reductions, transpose, matrix multiplication |
-| Autograd | Computation graph nodes, dependency ordering, backward traversal, gradient accumulation |
+| Tensor | Shape validation, indexing, reshape, arithmetic, reductions, transpose, matrix multiplication, row-add |
+| Autograd | Computation graph nodes, dependency ordering, backward traversal, gradient accumulation, all built-in ops covered |
 | Neural networks | `Linear`, `Sequential`, ReLU, Sigmoid, Tanh, Softmax |
 | Losses | Mean squared error and cross entropy |
 | Optimizers | SGD, Momentum, Adam |
-| Data | Deterministic linear regression, XOR, and spiral datasets |
-| Training | Reusable training configs, metrics, histories, and convergence examples |
-| CLI | `train-linear`, `train-xor`, `train-spiral`, `inspect` |
+| Data | Deterministic datasets (linear, XOR, spiral), CSV loader, row iterator, shuffle, train/test split |
+| Training | Reusable training configs, metrics, histories, graph-based backward propagation |
+| Serialization | Plain-text checkpoint save/load for `Linear` and `XorMlp` |
+| Backend | `Backend` trait with `CpuBackend`, ready for future GPU backends |
+| CLI | `train-linear`, `train-xor`, `train-spiral`, `inspect`, `--save-model`, `--output` |
 | Reports | Markdown summaries and CSV loss curves through `--output DIR` |
-| Quality | Unit tests, CLI integration tests, formatting, Clippy, and GitHub Actions CI |
+| Quality | 292 tests, Clippy clean, `cargo fmt` compliant, GitHub Actions CI |
 
 ## Project Structure
 
 ```text
 src/
   autograd/   dynamic computation graph and backward rules
-  data/       synthetic datasets used by examples and tests
+  backend/    Backend trait and CpuBackend for future GPU
+  data/       synthetic datasets, CSV loader, shuffle/split
   loss/       MSE and cross entropy losses
   nn/         layers, activations, and module abstractions
   optim/      SGD, Momentum, and Adam optimizers
   report/     Markdown and CSV training report export
+  serialize/  plain-text model checkpoint serialization
   tensor/     dense tensor shape, indexing, math, and reductions
-  train/      training loops and metrics
+  train/      graph-based training loops and metrics
   main.rs     command-line interface
 tests/
   cli.rs      end-to-end CLI integration tests
@@ -48,7 +52,7 @@ tests/
 - [Autograd design](docs/autograd.md): computation graph, backward propagation,
   gradient accumulation, and shape handling.
 - [Training workflow](docs/training.md): datasets, training loops, optimizer
-  flow, CLI examples, and report export.
+  flow, CLI examples, report export, and model serialization.
 - [Testing strategy](docs/testing.md): unit tests, CLI tests, integration
   coverage, reproducibility, and Windows notes.
 - [Technical report](docs/experiment-report.md): bilingual course report that
@@ -87,6 +91,12 @@ The `--output` directory receives:
 - `summary.md`: Markdown summary with training metrics and history table.
 - `history.csv`: CSV loss and accuracy curve for plotting or reports.
 
+Save trained model weights to a plain-text checkpoint:
+
+```bash
+cargo run -- train-xor --epochs 160 --save-model runs/xor.checkpoint
+```
+
 Inspect a compact snapshot of trained example models:
 
 ```bash
@@ -96,9 +106,9 @@ cargo run -- inspect
 ## CLI Reference
 
 ```text
-rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown] [--output DIR]
-rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown] [--output DIR]
-rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown] [--output DIR]
+rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown] [--output DIR] [--save-model PATH]
+rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown] [--output DIR] [--save-model PATH]
+rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown] [--output DIR] [--save-model PATH]
 rustgrad inspect
 rustgrad --version
 ```
@@ -113,14 +123,14 @@ Output formats:
 
 ```text
 XOR MLP training
-epochs=5
+epochs=160
 initial_loss=0.242958
-final_loss=0.232110
-best_loss=0.232110
-loss_improvement=0.010848
+final_loss=0.150075
+best_loss=0.150075
+loss_improvement=0.092884
 best_accuracy=1.000000
-last=epoch=5 loss=0.232110 accuracy=1.000000
-probabilities=[0.205530]; [0.791871]; [0.791871]; [0.206772]
+last=epoch=160 loss=0.150075 accuracy=1.000000
+probabilities=[0.155609]; [0.879026]; [0.879026]; [0.159095]
 classes=[0.000000]; [1.000000]; [1.000000]; [0.000000]
 ```
 

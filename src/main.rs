@@ -3,6 +3,7 @@ use rustgrad::report::{
     format_progress, history_to_csv, history_to_markdown, write_history_bundle, ReportBundle,
     TrainingSummary,
 };
+use rustgrad::serialize::{save_linear, save_xor_mlp};
 use rustgrad::tensor::Tensor;
 use rustgrad::train::{
     train_linear_regression, train_spiral_classifier, train_xor_mlp, TrainingConfig,
@@ -70,6 +71,7 @@ struct CommonOptions {
     learning_rate: f64,
     format: OutputFormat,
     output_dir: Option<PathBuf>,
+    save_model: Option<PathBuf>,
 }
 
 impl CommonOptions {
@@ -79,6 +81,7 @@ impl CommonOptions {
             learning_rate,
             format: OutputFormat::Text,
             output_dir: None,
+            save_model: None,
         }
     }
 
@@ -193,6 +196,11 @@ fn run_train_linear(args: &[String]) -> CliResult<String> {
         ));
     }
 
+    if let Some(path) = &options.common.save_model {
+        save_linear(result.model(), path)?;
+        output.push_str(&format!("\nmodel_saved={}", path.display()));
+    }
+
     Ok(output)
 }
 
@@ -215,6 +223,11 @@ fn run_train_xor(args: &[String]) -> CliResult<String> {
         output.push_str(&format_matrix_rows(&probabilities)?);
         output.push_str("\nclasses=");
         output.push_str(&format_matrix_rows(&classes)?);
+    }
+
+    if let Some(path) = &options.common.save_model {
+        save_xor_mlp(result.model(), path)?;
+        output.push_str(&format!("\nmodel_saved={}", path.display()));
     }
 
     Ok(output)
@@ -246,6 +259,11 @@ fn run_train_spiral(args: &[String]) -> CliResult<String> {
             options.samples_per_class,
             result.model().weights().dims()
         ));
+    }
+
+    if let Some(path) = &options.common.save_model {
+        save_linear(result.model(), path)?;
+        output.push_str(&format!("\nmodel_saved={}", path.display()));
     }
 
     Ok(output)
@@ -317,6 +335,10 @@ fn parse_linear_options(args: &[String]) -> CliResult<LinearOptions> {
                 options.common.output_dir =
                     Some(PathBuf::from(take_value(args, &mut index, "--output")?));
             }
+            "--save-model" => {
+                options.common.save_model =
+                    Some(PathBuf::from(take_value(args, &mut index, "--save-model")?));
+            }
             "--samples" => {
                 options.samples = parse_usize(take_value(args, &mut index, "--samples")?)?;
             }
@@ -355,6 +377,10 @@ fn parse_xor_options(args: &[String]) -> CliResult<XorOptions> {
                 options.common.output_dir =
                     Some(PathBuf::from(take_value(args, &mut index, "--output")?));
             }
+            "--save-model" => {
+                options.common.save_model =
+                    Some(PathBuf::from(take_value(args, &mut index, "--save-model")?));
+            }
             flag => return Err(unknown_flag("train-xor", flag)),
         }
         index += 1;
@@ -383,6 +409,10 @@ fn parse_spiral_options(args: &[String]) -> CliResult<SpiralOptions> {
             "--output" => {
                 options.common.output_dir =
                     Some(PathBuf::from(take_value(args, &mut index, "--output")?));
+            }
+            "--save-model" => {
+                options.common.save_model =
+                    Some(PathBuf::from(take_value(args, &mut index, "--save-model")?));
             }
             "--samples-per-class" => {
                 options.samples_per_class =
@@ -512,9 +542,9 @@ fn help_text() -> String {
         format!("rustgrad {}", rustgrad::version()),
         String::from(""),
         String::from("Usage:"),
-        String::from("  rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown] [--output DIR]"),
-        String::from("  rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown] [--output DIR]"),
-        String::from("  rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown] [--output DIR]"),
+        String::from("  rustgrad train-linear [--epochs N] [--learning-rate LR] [--samples N] [--slope V] [--intercept V] [--format text|csv|markdown] [--output DIR] [--save-model PATH]"),
+        String::from("  rustgrad train-xor [--epochs N] [--learning-rate LR] [--format text|csv|markdown] [--output DIR] [--save-model PATH]"),
+        String::from("  rustgrad train-spiral [--epochs N] [--learning-rate LR] [--samples-per-class N] [--classes N] [--format text|csv|markdown] [--output DIR] [--save-model PATH]"),
         String::from("  rustgrad inspect"),
         String::from("  rustgrad --version"),
     ]
@@ -705,5 +735,47 @@ mod tests {
             .expect_err("missing value should fail");
 
         assert_eq!(error.to_string(), "missing value for --epochs");
+    }
+
+    #[test]
+    fn save_model_option_writes_linear_checkpoint() {
+        let directory = unique_temp_dir("save-linear");
+        let model_path = directory.join("linear.checkpoint");
+        let model_arg = model_path.to_string_lossy().to_string();
+
+        let output = execute([
+            "train-linear".to_string(),
+            "--epochs".to_string(),
+            "3".to_string(),
+            "--save-model".to_string(),
+            model_arg,
+        ])
+        .expect("command should succeed");
+
+        assert!(output.contains("model_saved="));
+        assert!(model_path.exists());
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn save_model_option_writes_xor_checkpoint() {
+        let directory = unique_temp_dir("save-xor");
+        let model_path = directory.join("xor.checkpoint");
+        let model_arg = model_path.to_string_lossy().to_string();
+
+        let output = execute([
+            "train-xor".to_string(),
+            "--epochs".to_string(),
+            "3".to_string(),
+            "--save-model".to_string(),
+            model_arg,
+        ])
+        .expect("command should succeed");
+
+        assert!(output.contains("model_saved="));
+        assert!(model_path.exists());
+
+        fs::remove_dir_all(directory).expect("cleanup should succeed");
     }
 }

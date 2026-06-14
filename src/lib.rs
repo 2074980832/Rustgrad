@@ -4,12 +4,14 @@
 //! neural network layers, losses, optimizers, and small training examples.
 
 pub mod autograd;
+pub mod backend;
 pub mod data;
 pub mod error;
 pub mod loss;
 pub mod nn;
 pub mod optim;
 pub mod report;
+pub mod serialize;
 pub mod tensor;
 pub mod train;
 
